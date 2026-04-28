@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "PENgram relationship type vocabulary. Source of truth is pengram/vocabulary.py — this JSON mirrors it for non-Python consumers.",
+  "version": "1.0.0",
+  "semantic_types": {
+    "knowledge_evolution": {
+      "description": "How knowledge changes over time.",
+      "types": {
+        "supersedes": "This replaces an outdated understanding.",
+        "updates": "This adds to or refines existing knowledge.",
+        "evolution_of": "This shows how thinking changed over time."
+      }
+    },
+    "evidence": {
+      "description": "How claims relate to each other as evidence.",
+      "types": {
+        "supports": "This provides evidence for another claim.",
+        "contradicts": "This challenges another claim.",
+        "disputes": "This questions the reasoning of another."
+      }
+    },
+    "hierarchy": {
+      "description": "Containment and peer relationships.",
+      "types": {
+        "parent_of": "This is a broader topic containing the other.",
+        "child_of": "This is a subtopic of the other.",
+        "sibling_of": "These are peers under the same parent topic.",
+        "composed_of": "This is made up of the other.",
+        "part_of": "This is a component of the other."
+      }
+    },
+    "causation": {
+      "description": "Causal and prerequisite relationships.",
+      "types": {
+        "causes": "This leads to or produces the other.",
+        "influenced_by": "This was shaped by the other.",
+        "prerequisite_for": "This must come before the other."
+      }
+    },
+    "implementation": {
+      "description": "Realization, documentation, testing, and instance relationships.",
+      "types": {
+        "implements": "This is a concrete realization of the other.",
+        "documents": "This describes or records the other.",
+        "tests": "This validates or verifies the other.",
+        "example_of": "This is an instance of a general pattern."
+      }
+    },
+    "conversation": {
+      "description": "Dialogue, citation, and creative lineage.",
+      "types": {
+        "responds_to": "This is a reply or reaction to the other.",
+        "references": "This cites or points to the other.",
+        "inspired_by": "This was sparked by the other."
+      }
+    },
+    "sequence": {
+      "description": "Process ordering.",
+      "types": {
+        "follows": "This comes after the other in a process.",
+        "precedes": "This comes before the other in a process."
+      }
+    },
+    "dependencies": {
+      "description": "Runtime or logical dependencies.",
+      "types": {
+        "depends_on": "This requires the other to function."
+      }
+    }
+  },
+  "structural_types": {
+    "description": "Deterministic code/AST relationships produced by tree-sitter extraction.",
+    "types": {
+      "calls": "Function or method invokes another.",
+      "imports": "Module imports another module.",
+      "uses": "Symbol uses another symbol (variable, type reference).",
+      "extends": "Class extends a parent class.",
+      "implements_interface": "Class implements an interface or protocol.",
+      "instantiates": "Code instantiates a class or type.",
+      "overrides": "Method overrides a parent method.",
+      "decorates": "Decorator wraps a function or class."
+    }
+  },
+  "confidence_labels": {
+    "EXTRACTED": "Relationship stated explicitly in the source content.",
+    "INFERRED": "Relationship deduced from context but not explicitly stated.",
+    "AMBIGUOUS": "Relationship uncertain; best-effort classification."
+  },
+  "defaults": {
+    "description": "Fallback relationship type per entity kind when the LLM cannot confidently assign a type.",
+    "by_kind": {
+      "category": "part_of",
+      "concept": "references",
+      "document": "references",
+      "code": "references",
+      "transcript": "references"
+    }
+  }
+}

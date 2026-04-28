@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PENgram artifacts
+.pengram-cache/
+pengram-out/
+
+# Environment
+.env
+.env.*
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml

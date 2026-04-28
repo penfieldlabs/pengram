@@ -1,0 +1,14 @@
+# .pengramignore — gitignore-style patterns for files PENgram should skip.
+# Copy to `.pengramignore` at your project root to enable.
+
+# Large vendored data
+data/raw/
+*.sqlite
+*.parquet
+
+# Generated artifacts
+build/
+dist/
+
+# Tests or fixtures you don't want extracted
+tests/fixtures/
