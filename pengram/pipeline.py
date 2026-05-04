@@ -19,7 +19,7 @@ from . import detect as _detect
 from . import extract_llm
 from ._ui import say, warn
 from .build import normalize_id
-from .extract_llm import Document
+from .extract_llm import Document, _coerce_mentions, _fuzzy_key
 from .link import Entity, link_all
 from .llm import LLMError
 from .vocabulary import (
@@ -41,6 +41,7 @@ class RunConfig:
     extract_model: str
     link_model: str
     synth_model: str
+    image_model: str
     extract_timeout: int
     link_timeout: int
     synth_timeout: int
@@ -61,15 +62,18 @@ class RunConfig:
             extract = prov.get("extract_model", _config.LLM["extract_model"])
             link = prov.get("link_model", _config.LLM["link_model"])
             synth = prov.get("synth_model", _config.LLM["synth_model"])
+            image = prov.get("image_model", _config.LLM.get("image_model", "sonnet"))
         else:
             extract = _config.LLM["extract_model"]
             link = _config.LLM["link_model"]
             synth = _config.LLM["synth_model"]
+            image = _config.LLM.get("image_model", extract)
         return cls(
             provider=provider,
             extract_model=llm_model or extract,
             link_model=llm_model or link,
             synth_model=synth,
+            image_model=image,
             extract_timeout=int(_config.LLM.get("extract_timeout", 300)),
             link_timeout=int(_config.LLM.get("link_timeout", 300)),
             synth_timeout=int(_config.LLM.get("synth_timeout", 300)),
@@ -138,6 +142,11 @@ def build_semantic_extraction(
          have >=2 mentions in the same doc. After linking, drop edges
          whose relation is the vocabulary default for the source kind
          AND whose confidence is ``AMBIGUOUS``.
+
+    The pipeline is deterministic given the same LLM results: entity
+    IDs are derived from canonical names, edges are emitted in
+    document order, and results are sorted by ``doc_id``. Re-running
+    with cached LLM results produces identical output.
     """
     docs_by_id: dict[str, Document] = {d.doc_id: d for d in documents} if documents else {}
 
@@ -148,6 +157,7 @@ def build_semantic_extraction(
     def _entity_note(entity: dict[str, Any]) -> str:
         return str(entity.get("note") or "").strip()
 
+    fuzzy_to_canonical: dict[str, str] = {}
     notes_by_id: dict[str, str] = {}
     for kind_key, node_kind in _ENTITY_KINDS:
         for entity in canonical.get(kind_key, []) or []:
@@ -157,11 +167,13 @@ def build_semantic_extraction(
             if not name:
                 continue
             node_id = _entity_id(node_kind, name)
+            fk = f"{node_kind}:{_fuzzy_key(name)}"
+            fuzzy_to_canonical[fk] = node_id
             nodes[node_id] = {
                 "id": node_id,
                 "label": name,
                 "kind": node_kind,
-                "mentions": int(entity.get("mentions", 1) or 1),
+                "mentions": _coerce_mentions(entity.get("mentions")),
                 "confidence": CONFIDENCE_EXTRACTED,
             }
 
@@ -186,9 +198,17 @@ def build_semantic_extraction(
             if str(rel_dir := PurePosixPath(doc_id).parent) in (".", "")
             else str(rel_dir),
             "summary": str(result.get("summary", "")),
-            "body": doc.text if doc else "",
+            "body": doc.text
+            if doc
+            else (
+                str(result.get("summary", ""))
+                if doc_id.startswith("image:") and result.get("summary")
+                else ""
+            ),
             "confidence": CONFIDENCE_EXTRACTED,
         }
+        if doc_id.startswith("image:"):
+            node_attrs["_abs_source_path"] = source
         if doc:
             for key in _YT_META_PROPAGATE:
                 val = doc.metadata.get(key)
@@ -209,20 +229,15 @@ def build_semantic_extraction(
                 name = _entity_name(entity)
                 if not name:
                     continue
-                node_id = _entity_id(node_kind, name)
-                if node_id not in nodes:
-                    nodes[node_id] = {
-                        "id": node_id,
-                        "label": name,
-                        "kind": node_kind,
-                        "mentions": int(entity.get("mentions", 1) or 1),
-                        "confidence": CONFIDENCE_EXTRACTED,
-                    }
+                fk = f"{node_kind}:{_fuzzy_key(name)}"
+                node_id = fuzzy_to_canonical.get(fk)
+                if node_id is None or node_id not in nodes:
+                    continue
                 note = _entity_note(entity)
                 if note and len(note) > len(notes_by_id.get(node_id, "")):
                     notes_by_id[node_id] = note
 
-                doc_mentions = int(entity.get("mentions", 1) or 1)
+                doc_mentions = _coerce_mentions(entity.get("mentions"))
                 prev = per_doc_mentions.get(node_id, 0)
                 per_doc_mentions[node_id] = max(prev, doc_mentions)
                 appearances.setdefault(node_id, []).append(doc_node_id)
@@ -250,11 +265,12 @@ def build_semantic_extraction(
                     ordered.append(norm)
             nodes[node_id]["appearances"] = ordered
 
+    link_stats = None
     if run_linker and any(doc_entities.values()):
         link_pairs = build_link_pairs(nodes, doc_entities)
         if link_pairs:
             try:
-                decisions = link_all(
+                decisions, link_stats = link_all(
                     link_pairs,
                     output_dir=output_dir,
                     model=link_model,
@@ -281,7 +297,10 @@ def build_semantic_extraction(
             if dropped:
                 say(f"  Dropped {dropped} AMBIGUOUS default edges from the linker.")
 
-    return {"nodes": list(nodes.values()), "edges": edges}
+    result: dict[str, Any] = {"nodes": list(nodes.values()), "edges": edges}
+    if link_stats is not None:
+        result["_link_stats"] = link_stats
+    return result
 
 
 def build_link_pairs(

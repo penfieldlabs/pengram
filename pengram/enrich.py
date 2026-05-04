@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -157,8 +158,15 @@ Rules:
 - Prefer precision over recall. Empty arrays and empty strings are fine.
 - Quote text verbatim from the contexts. Do not paraphrase quotes.
 - merge_into is OFF by default. Only set it when you're confident the two
-  names refer to the same entity ("AMPK" / "AMP kinase", "Belief" /
-  "Beliefs"). If uncertain, leave it null.
+  names refer to the same entity. Recognized patterns:
+  - Surface-form variants: "AMPK" / "AMP kinase"
+  - Plural/singular: "Belief" / "Beliefs"
+  - Acronym/expansion: "DNA" / "deoxyribonucleic acid"
+  - Generic-suffix noun: "Apollo" / "Apollo system" / "Apollo project" /
+    "Apollo target" / "Apollo discovery" — when the suffix is a generic
+    domain noun for the same entity, merge into the most specific name
+    (typically the longest/most-mentioned form).
+  If uncertain, leave it null.
 - Respond with JSON only. No commentary, no markdown fences.
 """
 
@@ -199,6 +207,24 @@ def _find_mention_windows(
     return slices
 
 
+def _label_candidates(name: str) -> list[str]:
+    """Build search candidates from a concept label.
+
+    For ``"gold equivalent (AuEq)"`` returns
+    ``["gold equivalent (AuEq)", "gold equivalent", "AuEq"]``.
+    """
+    candidates = [name]
+    paren = re.search(r"\(([^)]+)\)", name)
+    if paren:
+        stripped = re.sub(r"\s*\([^)]*\)\s*", " ", name).strip()
+        if stripped and stripped.lower() != name.lower():
+            candidates.append(stripped)
+        abbrev = paren.group(1).strip()
+        if abbrev and abbrev.lower() != name.lower():
+            candidates.append(abbrev)
+    return candidates
+
+
 def gather_contexts(
     g: nx.Graph,
     concept_id: str,
@@ -214,6 +240,10 @@ def gather_contexts(
     body (if the doc is short) or ±``window``-char slices around every
     mention of the concept's label. Caps on context count and total
     characters bound prompt size.
+
+    For compound labels like ``"gold equivalent (AuEq)"``, the search
+    also tries the base name (``"gold equivalent"``) and the
+    parenthetical abbreviation (``"AuEq"``).
     """
     if concept_id not in g.nodes:
         return []
@@ -221,6 +251,8 @@ def gather_contexts(
     name = str(concept.get("label", concept_id)).strip()
     if not name:
         return []
+
+    candidates = _label_candidates(name)
 
     contexts: list[ConceptContext] = []
     total = 0
@@ -242,10 +274,15 @@ def gather_contexts(
         if len(body) <= full_doc_cutoff:
             text = body
         else:
-            windows = _find_mention_windows(body, name, window=window)
-            if not windows:
-                continue
-            text = "\n---\n".join(windows)
+            windows: list[str] = []
+            for candidate in candidates:
+                windows = _find_mention_windows(body, candidate, window=window)
+                if windows:
+                    break
+            if windows:
+                text = "\n---\n".join(windows)
+            else:
+                text = body[:window].rstrip()
         if not text.strip():
             continue
         remaining = max_chars - total
@@ -406,44 +443,15 @@ def clear_cache(cache_dir: Path) -> int:
     return removed
 
 
-def _normalize_for_dedup(label: str) -> str:
-    """Collapse plurals and hyphenation variants to a canonical key."""
-    s = label.strip().lower()
-    s = re.sub(r"[-\s]+", "", s)
-    if len(s) > 3 and s.endswith("s") and not s.endswith("ss"):
-        s = s[:-1]
-    return s
+@dataclass
+class EnrichmentStats:
+    """Phase-level counts from :func:`enrich_concepts`."""
 
-
-def _deterministic_dedup(
-    g: nx.Graph,
-    concept_ids: list[str],
-) -> list[EnrichmentResult]:
-    """Catch obvious surface-form duplicates the LLM might miss.
-
-    Groups concepts by a normalised key (lowercased, hyphens removed,
-    trailing plural 's' stripped). Within each collision group the
-    highest-mention concept is canonical; the rest get merge directives.
-    """
-    groups: dict[str, list[tuple[str, str, int]]] = {}
-    for cid in concept_ids:
-        if cid not in g.nodes:
-            continue
-        node = g.nodes[cid]
-        label = str(node.get("label", cid))
-        norm = _normalize_for_dedup(label)
-        mentions = int(node.get("mentions", 1) or 1)
-        groups.setdefault(norm, []).append((cid, label, mentions))
-
-    results: list[EnrichmentResult] = []
-    for _norm, members in groups.items():
-        if len(members) < 2:
-            continue
-        members.sort(key=lambda x: (-x[2], len(x[1]), x[1]))
-        canonical_label = members[0][1]
-        for cid, _label, _mentions in members[1:]:
-            results.append(EnrichmentResult(concept_id=cid, merge_into_label=canonical_label))
-    return results
+    total: int = 0
+    succeeded: int = 0
+    empty: int = 0
+    failed: int = 0
+    error_classes: Counter[str] = field(default_factory=Counter)
 
 
 def enrich_concepts(
@@ -457,7 +465,7 @@ def enrich_concepts(
     llm: Callable[..., str] | None = None,
     cache_dir: Path | None = None,
     provider: str | None = None,
-) -> list[EnrichmentResult]:
+) -> tuple[list[EnrichmentResult], EnrichmentStats]:
     """Run enrichment for every concept that has source contexts.
 
     When ``cache_dir`` is set, previously-enriched concepts are loaded
@@ -480,7 +488,7 @@ def enrich_concepts(
         concept_ids = [n for n in g.nodes if g.nodes[n].get("kind") == "concept"]
     ids = sorted(concept_ids)
     if not ids:
-        return []
+        return [], EnrichmentStats()
 
     # Load whatever's been enriched previously. Concepts that appear in
     # the current graph AND in the cache are lifted straight out; only
@@ -489,13 +497,22 @@ def enrich_concepts(
     cache_hits: dict[str, EnrichmentResult] = {
         cid: cached_results[cid] for cid in ids if cid in cached_results
     }
-    fresh_ids: list[str] = [cid for cid in ids if cid not in cache_hits]
+    not_cached: list[str] = [cid for cid in ids if cid not in cache_hits]
+    fresh_ids: list[str] = [cid for cid in not_cached if gather_contexts(g, cid)]
+    skipped_no_context = len(not_cached) - len(fresh_ids)
 
-    if cache_hits:
-        _ui_say(
-            f"  Enrichment: {len(cache_hits)} concept(s) loaded from cache; "
-            f"{len(fresh_ids)} to enrich"
-        )
+    if cache_hits or fresh_ids or skipped_no_context:
+        parts: list[str] = []
+        if cache_hits:
+            parts.append(f"{len(cache_hits)} from cache")
+        if fresh_ids:
+            parts.append(f"{len(fresh_ids)} to enrich")
+        if skipped_no_context:
+            parts.append(f"{skipped_no_context} skipped (no source contexts)")
+        _ui_say(f"  Enrichment: {', '.join(parts)}")
+
+    error_classes: Counter[str] = Counter()
+    failed_ids: set[str] = set()
 
     def _run(concept_id: str) -> EnrichmentResult | None:
         contexts = gather_contexts(g, concept_id)
@@ -506,21 +523,17 @@ def enrich_concepts(
         try:
             raw = caller(prompt, model=model, timeout=timeout, provider=provider)
         except Exception as exc:
+            error_classes[type(exc).__name__] += 1
+            failed_ids.add(concept_id)
             _ui_warn(f"enrichment failed for {concept_id}: {exc.__class__.__name__}: {exc}")
             return EnrichmentResult(concept_id=concept_id)
         result = _parse_enrichment(concept_id, raw)
-        # Persist immediately — a crash at concept N preserves 0..N-1.
-        # Empty results (parse failure, vacant response) are deliberately
-        # NOT cached: caching would pin the concept to a permanent no-op;
-        # skipping the write lets the next run retry with the same or a
-        # different LLM.
         if result.is_empty():
             _ui_warn(f"enrichment returned empty for {concept_id}")
         elif cache_dir is not None:
             _save_cache_entry(cache_dir, result)
         return result
 
-    # Progress granularity: ~10 lines total regardless of corpus size.
     total_fresh = len(fresh_ids)
     progress_step = max(1, total_fresh // 10) if total_fresh else 1
 
@@ -548,6 +561,7 @@ def enrich_concepts(
                     r = fut.result()
                 except Exception as exc:
                     cid = futures[fut]
+                    error_classes[type(exc).__name__] += 1
                     _ui_warn(f"enrichment failed for {cid}: {exc.__class__.__name__}: {exc}")
                     continue
                 if r is not None:
@@ -557,20 +571,37 @@ def enrich_concepts(
     if total_fresh:
         _announce(total_fresh)
 
+    failed = sum(error_classes.values())
+    empty = sum(1 for cid, r in fresh_results.items() if r.is_empty() and cid not in failed_ids)
+    succeeded = total_fresh - empty - failed
+    if failed or empty:
+        parts = [f"{succeeded}/{total_fresh} succeeded"]
+        if empty:
+            parts.append(f"{empty} empty")
+        if failed:
+            breakdown = ", ".join(f"{n} {cls}" for cls, n in error_classes.most_common())
+            parts.append(f"{failed} failed ({breakdown})")
+        _ui_say(f"  Enrichment: {', '.join(parts)}")
+        if total_fresh and failed / total_fresh > 0.1:
+            _ui_warn(
+                f"Enrichment failure rate {failed}/{total_fresh} "
+                f"({100 * failed // total_fresh}%) exceeds 10%"
+            )
+
     combined: dict[str, EnrichmentResult] = {**cache_hits, **fresh_results}
     results = [combined[cid] for cid in ids if cid in combined]
 
-    dedup_merges = _deterministic_dedup(g, ids)
-    if dedup_merges:
-        _ui_say(f"  Deterministic dedup: {len(dedup_merges)} surface-form duplicate(s) detected")
-    for dm in dedup_merges:
-        existing = combined.get(dm.concept_id)
-        if existing and not existing.merge_into_label:
-            existing.merge_into_label = dm.merge_into_label
-        elif not existing:
-            results.append(dm)
-
-    return results
+    cache_succeeded = len(cache_hits)
+    total = cache_succeeded + total_fresh
+    succeeded = cache_succeeded + (total_fresh - empty - failed)
+    stats = EnrichmentStats(
+        total=total,
+        succeeded=succeeded,
+        empty=empty,
+        failed=failed,
+        error_classes=error_classes,
+    )
+    return results, stats
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +737,11 @@ def _mentions_union(src: dict[str, Any], dst: dict[str, Any]) -> None:
             merged.append(a)
     if merged:
         dst["appearances"] = merged
+    src_quotes: list[dict[str, str]] = list(src.get("quotes") or [])
+    dst_quotes: list[dict[str, str]] = list(dst.get("quotes") or [])
+    if src_quotes:
+        seen_texts = {q.get("text", "") for q in dst_quotes}
+        dst["quotes"] = dst_quotes + [q for q in src_quotes if q.get("text", "") not in seen_texts]
 
 
 def apply_enrichment(
@@ -736,7 +772,7 @@ def apply_enrichment(
     # ``quotes`` and ``cross_source_notes`` are kept separate from the
     # original per-document ``note`` — the concept-body renderer handles
     # layout and dedup between them.
-    enriched_count = 0
+    enriched_ids: set[str] = set()
     for r in results:
         target = merges.get(r.concept_id, r.concept_id)
         if target not in g.nodes:
@@ -744,11 +780,17 @@ def apply_enrichment(
         node = g.nodes[target]
         if r.definition:
             node["definition"] = r.definition
-            enriched_count += 1
+            enriched_ids.add(target)
         if r.quotes:
-            node["quotes"] = r.quotes
+            existing_quotes: list[dict[str, str]] = node.get("quotes") or []
+            seen_texts = {q["text"] for q in existing_quotes}
+            node["quotes"] = existing_quotes + [q for q in r.quotes if q["text"] not in seen_texts]
         if r.cross_source_notes:
-            node["cross_source_notes"] = r.cross_source_notes
+            existing_notes = str(node.get("cross_source_notes") or "")
+            if existing_notes:
+                node["cross_source_notes"] = existing_notes + "\n\n" + r.cross_source_notes
+            else:
+                node["cross_source_notes"] = r.cross_source_notes
         node.setdefault("confidence", CONFIDENCE_INFERRED)
 
     # Fallback: promote 'note' to 'definition' for unenriched concepts.
@@ -759,12 +801,13 @@ def apply_enrichment(
         if not node.get("definition") and node.get("note"):
             node["definition"] = node["note"]
 
-    return len(merges), enriched_count
+    return len(merges), len(enriched_ids)
 
 
 __all__ = [
     "ConceptContext",
     "EnrichmentResult",
+    "EnrichmentStats",
     "ENRICH_PROMPT",
     "gather_contexts",
     "enrich_concepts",

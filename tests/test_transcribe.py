@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -42,11 +41,12 @@ def test_transcribe_unknown_mode(tmp_path: Path) -> None:
         transcribe.transcribe(media, mode="telepathy")
 
 
-def test_transcribe_all_uses_sidecar(tmp_path: Path) -> None:
+def test_transcribe_all_skips_existing_transcript(tmp_path: Path) -> None:
+    """When <stem>.transcript already exists, Whisper must not run."""
     media = tmp_path / "a.mp3"
     media.write_bytes(b"\x00")
-    sidecar = media.with_suffix(media.suffix + ".transcript.json")
-    sidecar.write_text(json.dumps({"text": "hello world"}))
+    transcript = tmp_path / "a.transcript"
+    transcript.write_text("pre-existing transcript")
 
     called: list[Path] = []
 
@@ -54,24 +54,87 @@ def test_transcribe_all_uses_sidecar(tmp_path: Path) -> None:
         called.append(p)
         return "should not be called"
 
-    results = transcribe.transcribe_all([media], transcriber=transcriber)
-    assert results[media] == "hello world"
+    paths = transcribe.transcribe_all([media], transcriber=transcriber)
+    assert paths == [transcript]
     assert called == []
 
 
-def test_transcribe_all_writes_sidecar(tmp_path: Path) -> None:
+def test_transcribe_all_writes_plain_text_transcript(tmp_path: Path) -> None:
+    """Whisper output is written as plain text to <stem>.transcript."""
     media = tmp_path / "a.mp3"
     media.write_bytes(b"\x00")
 
     def transcriber(p: Path) -> str:
         return "fresh transcript"
 
-    results = transcribe.transcribe_all([media], transcriber=transcriber)
-    assert results[media] == "fresh transcript"
-    sidecar = media.with_suffix(media.suffix + ".transcript.json")
-    assert sidecar.exists()
-    payload = json.loads(sidecar.read_text())
-    assert payload["text"] == "fresh transcript"
+    paths = transcribe.transcribe_all([media], transcriber=transcriber)
+    assert len(paths) == 1
+    tp = paths[0]
+    assert tp == tmp_path / "a.transcript"
+    assert tp.exists()
+    assert tp.read_text(encoding="utf-8") == "fresh transcript"
+
+
+def test_transcribe_all_returns_both_existing_and_new(tmp_path: Path) -> None:
+    """Mix of pre-existing and new transcripts returns all paths."""
+    m1 = tmp_path / "a.mp3"
+    m1.write_bytes(b"\x00")
+    m2 = tmp_path / "b.wav"
+    m2.write_bytes(b"\x00")
+    (tmp_path / "a.transcript").write_text("existing")
+
+    def transcriber(p: Path) -> str:
+        return f"transcript for {p.name}"
+
+    paths = transcribe.transcribe_all([m1, m2], transcriber=transcriber)
+    assert len(paths) == 2
+    assert (tmp_path / "a.transcript") in paths
+    assert (tmp_path / "b.transcript") in paths
+    assert (tmp_path / "b.transcript").read_text() == "transcript for b.wav"
+
+
+def test_transcribe_all_delete_transcript_retriggers_whisper(tmp_path: Path) -> None:
+    """Deleting the .transcript file must trigger re-transcription."""
+    media = tmp_path / "a.mp3"
+    media.write_bytes(b"\x00")
+
+    call_count = {"n": 0}
+
+    def transcriber(p: Path) -> str:
+        call_count["n"] += 1
+        return f"transcript v{call_count['n']}"
+
+    # First run writes the transcript.
+    transcribe.transcribe_all([media], transcriber=transcriber)
+    assert call_count["n"] == 1
+    assert (tmp_path / "a.transcript").read_text() == "transcript v1"
+
+    # Second run skips (transcript exists).
+    transcribe.transcribe_all([media], transcriber=transcriber)
+    assert call_count["n"] == 1
+
+    # Delete transcript → third run must re-transcribe.
+    (tmp_path / "a.transcript").unlink()
+    transcribe.transcribe_all([media], transcriber=transcriber)
+    assert call_count["n"] == 2
+    assert (tmp_path / "a.transcript").read_text() == "transcript v2"
+
+
+def test_transcribe_all_failure_skips_file(tmp_path: Path, capsys: object) -> None:
+    """A Whisper failure must not crash the batch."""
+    m1 = tmp_path / "good.mp3"
+    m1.write_bytes(b"\x00")
+    m2 = tmp_path / "bad.wav"
+    m2.write_bytes(b"\x00")
+
+    def transcriber(p: Path) -> str:
+        if "bad" in p.name:
+            raise RuntimeError("Whisper crashed")
+        return "ok"
+
+    paths = transcribe.transcribe_all([m1, m2], transcriber=transcriber)
+    assert len(paths) == 1
+    assert paths[0] == tmp_path / "good.transcript"
 
 
 def test_transcribe_local_import_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -180,30 +243,3 @@ def test_transcribe_dispatch_openrouter(tmp_path: Path, monkeypatch: pytest.Monk
     media.write_bytes(b"\x00")
     transcribe.transcribe(media, mode="openrouter")
     assert seen["base_url"] == "https://openrouter.ai/api/v1"
-
-
-def test_transcribe_all_cache_sidecar_corrupt_falls_through(tmp_path: Path) -> None:
-    media = tmp_path / "a.mp3"
-    media.write_bytes(b"\x00")
-    sidecar = media.with_suffix(media.suffix + ".transcript.json")
-    sidecar.write_text("not json{")  # corrupt
-
-    def runner(p: Path) -> str:
-        return "fresh after corrupt sidecar"
-
-    results = transcribe.transcribe_all([media], transcriber=runner)
-    assert results[media] == "fresh after corrupt sidecar"
-
-
-def test_transcribe_all_cache_root_hit(tmp_path: Path) -> None:
-    media = tmp_path / "a.mp3"
-    media.write_bytes(b"\x00")
-    from pengram.cache import save_cached
-
-    save_cached(tmp_path, media, {"text": "from cache root"})
-
-    def runner(p: Path) -> str:
-        raise AssertionError("should not be called")
-
-    results = transcribe.transcribe_all([media], cache_root=tmp_path, transcriber=runner)
-    assert results[media] == "from cache root"

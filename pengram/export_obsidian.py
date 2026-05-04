@@ -19,18 +19,23 @@ from pathlib import Path
 import networkx as nx
 
 from . import vocabulary as _vocab
+from ._ui import step as _ui_step
 from .export_common import (
+    _IMAGE_EXTENSIONS,
     DEFAULT_THRESHOLDS,
     NoteSpec,
     _group_edges_by_relation,
     _incoming_category_backlinks,
     _subdir_for,
     build_slug_map,
+    copy_image_attachment,
     extract_metadata,
     format_frontmatter,
     included_nodes,
     note_type_of,
+    purge_stale_files,
     render_body,
+    write_text_if_changed,
 )
 
 
@@ -89,9 +94,11 @@ def export_obsidian(
     included = included_nodes(g, thresholds)
     slug_map = build_slug_map(g, included)
 
-    for node_id in g.nodes:
-        if node_id not in included:
-            continue
+    written: set[Path] = set()
+    included_list = [nid for nid in g.nodes if nid in included]
+    total = len(included_list)
+    progress_step = max(1, total // 10) if total else 1
+    for i, node_id in enumerate(included_list, 1):
         node = g.nodes[node_id]
         note_type = note_type_of(node)
         metadata = extract_metadata(node, note_type, slug_map=slug_map, node_id=node_id, g=g)
@@ -107,6 +114,17 @@ def export_obsidian(
             g, node_id, included_node_ids=included, slug_map=slug_map
         ).items():
             relationships.setdefault(rel, []).extend(targets)
+        subdir = _subdir_for(vault, note_type, node)
+        subdir.mkdir(parents=True, exist_ok=True)
+        slug = slug_map[node_id]
+        if note_type == "document":
+            embed_filename = copy_image_attachment(node, subdir, slug)
+            if embed_filename:
+                body = body.rstrip()
+                if body:
+                    body += "\n\n"
+                body += f"## Source\n\n![[{embed_filename}]]"
+                written.add(subdir / embed_filename)
         spec = NoteSpec(
             node_id=node_id,
             note_type=note_type,
@@ -114,9 +132,14 @@ def export_obsidian(
             metadata=metadata,
             relationships=relationships,
         )
-        subdir = _subdir_for(vault, note_type, node)
-        subdir.mkdir(parents=True, exist_ok=True)
-        (subdir / f"{slug_map[node_id]}.md").write_text(render_note(spec), encoding="utf-8")
+        md_path = subdir / f"{slug}.md"
+        write_text_if_changed(md_path, render_note(spec))
+        written.add(md_path)
+        if i % progress_step == 0 and i < total:
+            _ui_step(i, total, "Export (Obsidian)")
+    if total:
+        _ui_step(total, total, "Export (Obsidian)")
+    purge_stale_files(vault, written, extensions=frozenset({".md"}) | _IMAGE_EXTENSIONS)
     return vault
 
 

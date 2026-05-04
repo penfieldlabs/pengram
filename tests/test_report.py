@@ -86,3 +86,28 @@ def test_report_omits_single_node_communities() -> None:
     assert "Community 0" in report
     assert "Community 1" not in report
     assert "1 single-node communities omitted" in report
+
+
+def test_report_includes_pipeline_health_when_present() -> None:
+    g = nx.DiGraph()
+    g.add_node("a", label="Alice")
+    communities: dict[int, list[str]] = {0: ["a"]}
+    analysis = analyze(g, communities)
+    analysis["pipeline_health"] = [
+        {"phase": "Extraction", "total": 100, "succeeded": 90, "empty": 5, "failed": 5},
+        {"phase": "Enrichment", "total": 80, "succeeded": 70, "empty": 8, "failed": 2},
+    ]
+    report = render_report(g, analysis, communities)
+    assert "## Pipeline Health" in report
+    assert "| Extraction | 100 | 90 | 5 | 5 |" in report
+    assert "| Enrichment | 80 | 70 | 8 | 2 |" in report
+    assert "| Empty |" in report
+
+
+def test_report_omits_pipeline_health_when_absent() -> None:
+    g = nx.DiGraph()
+    g.add_node("a", label="Alice")
+    communities: dict[int, list[str]] = {0: ["a"]}
+    analysis = analyze(g, communities)
+    report = render_report(g, analysis, communities)
+    assert "## Pipeline Health" not in report

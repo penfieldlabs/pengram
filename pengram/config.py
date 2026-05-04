@@ -73,21 +73,25 @@ _DEFAULT_MODELS: dict[str, dict[str, str]] = {
         "extract_model": "haiku",
         "link_model": "haiku",
         "synth_model": "sonnet",
+        "image_model": "sonnet",
     },
     "openai": {
         "extract_model": "gpt-4o-mini",
         "link_model": "gpt-4o-mini",
         "synth_model": "gpt-4o-mini",
+        "image_model": "gpt-4o-mini",
     },
     "openrouter": {
         "extract_model": "openai/gpt-4o-mini",
         "link_model": "openai/gpt-4o-mini",
         "synth_model": "openai/gpt-4o-mini",
+        "image_model": "openai/gpt-4o-mini",
     },
     "ollama": {
         "extract_model": "_auto",
         "link_model": "_auto",
         "synth_model": "_auto",
+        "image_model": "_auto",
     },
 }
 
@@ -98,6 +102,7 @@ def _default_llm_config() -> dict[str, Any]:
         "extract_model": os.environ.get("PENGRAM_EXTRACT_MODEL", models["extract_model"]),
         "link_model": os.environ.get("PENGRAM_LINK_MODEL", models["link_model"]),
         "synth_model": os.environ.get("PENGRAM_SYNTH_MODEL", models["synth_model"]),
+        "image_model": os.environ.get("PENGRAM_IMAGE_MODEL", models["image_model"]),
         "parallel_workers": int(os.environ.get("PENGRAM_PARALLEL_WORKERS", "4")),
         "extract_timeout": int(os.environ.get("PENGRAM_EXTRACT_TIMEOUT", "300")),
         "link_timeout": int(os.environ.get("PENGRAM_LINK_TIMEOUT", "180")),

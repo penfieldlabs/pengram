@@ -11,13 +11,14 @@ declares YouTube provenance (``video_id`` attribute set).
 from __future__ import annotations
 
 import csv
+import io
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import networkx as nx
 
-from .export_common import _CONTENT_KINDS
+from .export_common import _CONTENT_KINDS, write_text_if_changed
 
 # Base columns for every catalog row.
 _BASE_COLUMNS: tuple[str, ...] = (
@@ -135,11 +136,12 @@ def export_catalog(
     output_dir.mkdir(parents=True, exist_ok=True)
     columns, rows = to_rows(g, communities)
     path = output_dir / filename
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    buf = io.StringIO(newline="")
+    writer = csv.DictWriter(buf, fieldnames=columns)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    write_text_if_changed(path, buf.getvalue().replace("\r\n", "\n"))
     return path
 
 

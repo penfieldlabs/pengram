@@ -158,6 +158,70 @@ def test_fetch_subtitles_translates_rate_limit(tmp_path: Path) -> None:
         client.fetch_subtitles(_VID, tmp_path)
 
 
+def test_fetch_subtitles_nonzero_exit_with_vtt_succeeds(tmp_path: Path) -> None:
+    """yt-dlp exits non-zero (e.g. EJS deprecation warning) but wrote a VTT."""
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        (tmp_path / f"{_VID}.en.vtt").write_text("WEBVTT\n\nhello\n")
+        return make_result(stderr="WARNING: no supported javascript runtime found", returncode=1)
+
+    client = YouTubeClient(runner=runner)
+    result = client.fetch_subtitles(_VID, tmp_path)
+    assert result is not None
+    assert result.name.endswith(".vtt")
+
+
+def test_fetch_subtitles_captionless_video_returns_none(tmp_path: Path) -> None:
+    """Captionless video: no VTT, non-zero exit → None, not an error."""
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return make_result(stderr="This video does not have auto-generated subtitles", returncode=1)
+
+    client = YouTubeClient(runner=runner)
+    assert client.fetch_subtitles(_VID, tmp_path) is None
+
+
+def test_fetch_subtitles_ejs_warning_with_vtt_exact_stderr(tmp_path: Path) -> None:
+    """Exact EJS deprecation stderr from tester's Gammon run."""
+    ejs_stderr = (
+        "WARNING: [youtube] no supported javascript runtime could be found. "
+        "Install one of: PhantomJS, node.js"
+    )
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        (tmp_path / f"{_VID}.en.vtt").write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n")
+        return make_result(stderr=ejs_stderr, returncode=1)
+
+    client = YouTubeClient(runner=runner)
+    result = client.fetch_subtitles(_VID, tmp_path)
+    assert result is not None
+
+
+def test_fetch_subtitles_ejs_warning_no_vtt_returns_none(tmp_path: Path) -> None:
+    """EJS warning + no VTT = None (captionless), not an error."""
+    ejs_stderr = (
+        "WARNING: [youtube] no supported javascript runtime could be found. "
+        "Install one of: PhantomJS, node.js"
+    )
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return make_result(stderr=ejs_stderr, returncode=1)
+
+    client = YouTubeClient(runner=runner)
+    assert client.fetch_subtitles(_VID, tmp_path) is None
+
+
+def test_fetch_subtitles_sign_in_is_rate_limited(tmp_path: Path) -> None:
+    """'sign in' in stderr is a genuine rate-limit signal."""
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return make_result(stderr="Please sign in to confirm you're not a bot", returncode=1)
+
+    client = YouTubeClient(runner=runner)
+    with pytest.raises(RuntimeError, match="rate_limited"):
+        client.fetch_subtitles(_VID, tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Catalog parsing
 # ---------------------------------------------------------------------------
@@ -531,3 +595,228 @@ def test_transcript_frontmatter_quotes_upload_date() -> None:
     text = '---\nvideo_id: v1\nupload_date: "2025-12-01"\n---\n\nbody\n'
     fm = parse_transcript_frontmatter(text)
     assert isinstance(fm["upload_date"], str)
+
+
+def test_pull_all_disk_cache_hit_skips_sleep(tmp_path: Path) -> None:
+    """When .transcript exists on disk but not in state, skip sleep."""
+    vid = "diskcache00x"
+    transcript = tmp_path / f"{vid}.transcript"
+    transcript.write_text("---\nvideo_id: diskcache00x\n---\ncached content")
+
+    client = FakeClient(subtitles_path=None)
+    sleeps: list[float] = []
+    catalog = [VideoMeta(video_id=vid, title="C", url="", channel="c", tab="videos")]
+    result = pull_all_transcripts(
+        catalog,
+        client=client,
+        work_dir=tmp_path,
+        sleep_between=2.0,
+        sleeper=sleeps.append,
+    )
+    assert result[vid].status == "ok"
+    assert client.calls == []
+    assert sleeps == []
+
+
+def test_pull_all_disk_cache_hit_not_counted_against_max_videos(tmp_path: Path) -> None:
+    """Disk cache hits must not decrement max_videos budget."""
+    cached_vid = "cached00001x"
+    fresh_vid = "freshv00001x"
+    transcript = tmp_path / f"{cached_vid}.transcript"
+    transcript.write_text("---\nvideo_id: cached00001x\n---\ncached")
+
+    vtt = tmp_path / f"{fresh_vid}.en.vtt"
+    vtt.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nfresh\n")
+    client = FakeClient(subtitles_path=vtt)
+
+    catalog = [
+        VideoMeta(video_id=cached_vid, title="A", url="", channel="c", tab="videos"),
+        VideoMeta(video_id=fresh_vid, title="B", url="", channel="c", tab="videos"),
+    ]
+    result = pull_all_transcripts(
+        catalog,
+        client=client,
+        work_dir=tmp_path,
+        max_videos=1,
+        sleep_between=0,
+    )
+    assert cached_vid in result
+    assert fresh_vid in result
+    assert client.calls == [fresh_vid]
+
+
+def test_pull_all_disk_cache_hits_persisted_to_state_file(tmp_path: Path) -> None:
+    """Disk cache hits are flushed to the state file by the trailing _persist."""
+    vid = "diskflush00x"
+    transcript = tmp_path / f"{vid}.transcript"
+    transcript.write_text("---\nvideo_id: diskflush00x\n---\ntext")
+
+    state_file = tmp_path / "state.json"
+    client = FakeClient(subtitles_path=None)
+    catalog = [VideoMeta(video_id=vid, title="F", url="", channel="c", tab="videos")]
+    pull_all_transcripts(
+        catalog,
+        client=client,
+        work_dir=tmp_path,
+        state_file=state_file,
+        sleep_between=0,
+    )
+    assert state_file.exists()
+    saved = json.loads(state_file.read_text())
+    assert saved[vid]["status"] == "ok"
+
+
+def test_pull_all_state_file_omits_transcript_text(tmp_path: Path) -> None:
+    """State file must not store full transcript text — only status and error."""
+    vid = "statetext00x"
+    vtt = tmp_path / f"{vid}.en.vtt"
+    vtt.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n")
+    client = FakeClient(subtitles_path=vtt)
+    state_file = tmp_path / "state.json"
+    catalog = [VideoMeta(video_id=vid, title="T", url="", channel="c", tab="videos")]
+    result = pull_all_transcripts(
+        catalog,
+        client=client,
+        work_dir=tmp_path,
+        state_file=state_file,
+        sleep_between=0,
+    )
+    assert result[vid].status == "ok"
+    saved = json.loads(state_file.read_text())
+    assert "text" not in saved[vid]
+    assert saved[vid]["status"] == "ok"
+
+
+def test_pull_all_reclassifies_stale_rate_limited_as_no_subtitles(tmp_path: Path) -> None:
+    """Stale rate_limited entries without a .transcript become no_subtitles."""
+    vid = "stalerl0001x"
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({vid: {"status": "rate_limited", "error": "old"}}))
+
+    client = FakeClient(subtitles_path=None)
+    catalog = [VideoMeta(video_id=vid, title="S", url="", channel="c", tab="videos")]
+    result = pull_all_transcripts(
+        catalog,
+        client=client,
+        work_dir=tmp_path,
+        state_file=state_file,
+        sleep_between=0,
+    )
+    assert result[vid].status == "no_subtitles"
+    assert client.calls == []
+
+
+def test_pull_all_reclassifies_stale_rate_limited_to_ok_when_transcript_exists(
+    tmp_path: Path,
+) -> None:
+    """Stale rate_limited entries WITH a .transcript become ok."""
+    vid = "staleok0001x"
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({vid: {"status": "rate_limited", "error": "old"}}))
+    (tmp_path / f"{vid}.transcript").write_text("---\nvideo_id: staleok0001x\n---\ncontent")
+
+    client = FakeClient(subtitles_path=None)
+    catalog = [VideoMeta(video_id=vid, title="S", url="", channel="c", tab="videos")]
+    result = pull_all_transcripts(
+        catalog,
+        client=client,
+        work_dir=tmp_path,
+        state_file=state_file,
+        sleep_between=0,
+    )
+    assert result[vid].status == "ok"
+    assert client.calls == []
+
+
+def test_pull_all_reclassifies_stale_error_as_no_subtitles(tmp_path: Path) -> None:
+    """Stale error entries without a .transcript become no_subtitles."""
+    vid = "staleerr001x"
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({vid: {"status": "error", "error": "yt-dlp broke"}}))
+
+    client = FakeClient(subtitles_path=None)
+    catalog = [VideoMeta(video_id=vid, title="E", url="", channel="c", tab="videos")]
+    result = pull_all_transcripts(
+        catalog,
+        client=client,
+        work_dir=tmp_path,
+        state_file=state_file,
+        sleep_between=0,
+    )
+    assert result[vid].status == "no_subtitles"
+    assert client.calls == []
+
+
+def test_fetch_subtitles_captionless_nonzero_exit_returns_none(tmp_path: Path) -> None:
+    """No VTT + non-zero exit + no rate-limit signal = None, not RuntimeError."""
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return make_result(stderr="some random yt-dlp error", returncode=1)
+
+    client = YouTubeClient(runner=runner)
+    assert client.fetch_subtitles(_VID, tmp_path) is None
+
+
+def test_pull_all_emits_progress_ticks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """10% progress ticks fire during transcript pulling."""
+    ticks: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(
+        "pengram.youtube._ui_step", lambda cur, tot, lbl: ticks.append((cur, tot, lbl))
+    )
+
+    catalog = []
+    for i in range(20):
+        vid = f"prog{i:07d}x"
+        vtt_copy = tmp_path / f"{vid}.en.vtt"
+        vtt_copy.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n")
+        catalog.append(VideoMeta(video_id=vid, title=f"V{i}", url="", channel="c", tab="videos"))
+
+    class CopyClient:
+        def fetch_subtitles(self, video_id: str, out_dir: Path) -> Path | None:
+            p = out_dir / f"{video_id}.en.vtt"
+            if p.exists():
+                return p
+            return None
+
+    pull_all_transcripts(
+        catalog,
+        client=CopyClient(),
+        work_dir=tmp_path,
+        sleep_between=0,
+    )
+    assert len(ticks) > 1
+    assert ticks[-1] == (20, 20, "Transcripts")
+    assert all(label == "Transcripts" for _, _, label in ticks)
+
+
+def test_pull_all_progress_final_tick_reflects_max_videos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final progress tick shows actual processed count, not catalog total."""
+    ticks: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(
+        "pengram.youtube._ui_step", lambda cur, tot, lbl: ticks.append((cur, tot, lbl))
+    )
+
+    catalog = []
+    for i in range(20):
+        vid = f"maxt{i:07d}x"
+        vtt = tmp_path / f"{vid}.en.vtt"
+        vtt.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n")
+        catalog.append(VideoMeta(video_id=vid, title=f"V{i}", url="", channel="c", tab="videos"))
+
+    class CopyClient:
+        def fetch_subtitles(self, video_id: str, out_dir: Path) -> Path | None:
+            p = out_dir / f"{video_id}.en.vtt"
+            return p if p.exists() else None
+
+    pull_all_transcripts(
+        catalog,
+        client=CopyClient(),
+        work_dir=tmp_path,
+        max_videos=3,
+        sleep_between=0,
+    )
+    final_cur, final_tot, _ = ticks[-1]
+    assert final_cur == 3
+    assert final_tot == 20

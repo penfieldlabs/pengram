@@ -79,7 +79,9 @@ def test_ambiguous_edges_dropped() -> None:
     from pathlib import Path
     from unittest.mock import patch
 
-    with patch("pengram.pipeline.link_all", return_value=fake_decisions):
+    from pengram.link import LinkStats
+
+    with patch("pengram.pipeline.link_all", return_value=(fake_decisions, LinkStats())):
         result = build_semantic_extraction(
             fake_llm_results,
             output_dir=Path("/tmp/test"),
@@ -210,3 +212,142 @@ def test_parse_transcript_meta(tmp_path: Path) -> None:
     assert meta["title"] == "Great"
     assert meta["views"] == 100
     assert "likes" not in meta  # NA values stripped
+
+
+def test_fuzzy_variants_resolve_to_single_node() -> None:
+    """Hyphen, plural, and case variants from raw results must resolve
+    to the single canonical node created by canonicalize_entities,
+    not spawn orphan nodes.
+    """
+    from pengram.pipeline import build_semantic_extraction
+
+    fake_llm_results = [
+        {
+            "_doc_id": "doc1.txt",
+            "_source": "doc1.txt",
+            "concepts": [
+                {"name": "Apollo system", "mentions": 5},
+                {"name": "Apollo-system", "mentions": 3},
+            ],
+            "summary": "Doc one.",
+        },
+        {
+            "_doc_id": "doc2.txt",
+            "_source": "doc2.txt",
+            "concepts": [
+                {"name": "apollo systems", "mentions": 2},
+            ],
+            "summary": "Doc two.",
+        },
+    ]
+
+    result = build_semantic_extraction(
+        fake_llm_results,
+        output_dir=Path("/tmp/test"),
+        run_linker=False,
+    )
+    concept_nodes = [n for n in result["nodes"] if n.get("kind") == "concept"]
+    assert len(concept_nodes) == 1
+    assert concept_nodes[0]["mentions"] == 10
+
+
+def test_fuzzy_variants_produce_correct_edges() -> None:
+    """Each raw variant should produce a doc→entity edge to the canonical
+    node, not a missing node.
+    """
+    from pengram.pipeline import build_semantic_extraction
+
+    fake_llm_results = [
+        {
+            "_doc_id": "doc1.txt",
+            "_source": "doc1.txt",
+            "concepts": [
+                {"name": "Machine Learning", "mentions": 4},
+                {"name": "machine-learning", "mentions": 2},
+            ],
+            "summary": "Doc one.",
+        },
+    ]
+
+    result = build_semantic_extraction(
+        fake_llm_results,
+        output_dir=Path("/tmp/test"),
+        run_linker=False,
+    )
+    concept_nodes = [n for n in result["nodes"] if n.get("kind") == "concept"]
+    assert len(concept_nodes) == 1
+    ref_edges = [
+        e
+        for e in result["edges"]
+        if e["relation"] == "references" and e["target"] == concept_nodes[0]["id"]
+    ]
+    assert len(ref_edges) == 2
+
+
+def test_adversarial_mentions_in_pipeline() -> None:
+    """String/None/dict mentions from LLM must not crash or corrupt the
+    pipeline node and edge assembly."""
+    from pengram.pipeline import build_semantic_extraction
+
+    fake_llm_results = [
+        {
+            "_doc_id": "doc1.txt",
+            "_source": "doc1.txt",
+            "concepts": [
+                {"name": "Alpha Concept", "mentions": "5"},
+                {"name": "Beta Concept", "mentions": None},
+                {"name": "Gamma Concept", "mentions": {"count": 3}},
+            ],
+            "summary": "Test document.",
+        },
+    ]
+
+    result = build_semantic_extraction(
+        fake_llm_results,
+        output_dir=Path("/tmp/test"),
+        run_linker=False,
+    )
+    concept_nodes = {n["label"]: n for n in result["nodes"] if n.get("kind") == "concept"}
+    assert concept_nodes["Alpha Concept"]["mentions"] == 5
+    assert concept_nodes["Beta Concept"]["mentions"] == 1
+    assert concept_nodes["Gamma Concept"]["mentions"] == 1
+    assert all(isinstance(n["mentions"], int) for n in concept_nodes.values())
+
+
+def test_build_semantic_extraction_idempotent_on_same_input() -> None:
+    """Two calls with identical LLM results must produce identical output."""
+    from pengram.pipeline import build_semantic_extraction
+
+    fake_llm_results = [
+        {
+            "_doc_id": "doc1.txt",
+            "_source": "doc1.txt",
+            "concepts": [
+                {"name": "Alpha Concept", "mentions": 5},
+                {"name": "Beta Concept", "mentions": 3},
+            ],
+            "summary": "First document.",
+        },
+        {
+            "_doc_id": "doc2.txt",
+            "_source": "doc2.txt",
+            "concepts": [
+                {"name": "Alpha Concept", "mentions": 2},
+                {"name": "Gamma Concept", "mentions": 1},
+            ],
+            "summary": "Second document.",
+        },
+    ]
+
+    r1 = build_semantic_extraction(
+        fake_llm_results,
+        output_dir=Path("/tmp/test-idem"),
+        run_linker=False,
+    )
+    r2 = build_semantic_extraction(
+        fake_llm_results,
+        output_dir=Path("/tmp/test-idem"),
+        run_linker=False,
+    )
+    assert r1["nodes"] == r2["nodes"]
+    assert r1["edges"] == r2["edges"]

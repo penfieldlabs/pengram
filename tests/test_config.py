@@ -248,3 +248,18 @@ def test_constants_exist() -> None:
     # v0.2.0: MAX_DOCUMENT_CHARS replaced by per-provider chunk sizes.
     assert c.default_chunk_chars() > 0
     assert c.default_chunk_overlap() >= 0
+
+
+def test_llm_config_includes_image_model() -> None:
+    from pengram import config as c
+
+    assert "image_model" in c.LLM
+    assert isinstance(c.LLM["image_model"], str)
+    assert len(c.LLM["image_model"]) > 0
+
+
+def test_all_providers_have_image_model_default() -> None:
+    from pengram.config import _DEFAULT_MODELS
+
+    for provider, models in _DEFAULT_MODELS.items():
+        assert "image_model" in models, f"{provider} missing image_model default"

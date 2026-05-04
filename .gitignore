@@ -31,6 +31,9 @@ pengram-out/
 .claude/
 CLAUDE.md
 
+# Internal specs (proposals, not decisions)
+pengram/docs/specs/
+
 # Test / coverage
 .pytest_cache/
 .coverage

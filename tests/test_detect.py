@@ -295,3 +295,7 @@ def test_collect_files_hidden_ignored(tmp_path: Path) -> None:
     all_paths = [str(p) for files in groups.values() for p in files]
     assert any("visible.py" in p for p in all_paths)
     assert not any(".hidden.py" in p for p in all_paths)
+
+
+def test_detect_no_longer_classifies_svg_as_image() -> None:
+    assert ".svg" not in detect.IMAGE_EXTENSIONS

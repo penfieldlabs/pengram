@@ -21,7 +21,7 @@ from typing import Any
 
 import networkx as nx
 
-from ._ui import warn as _ui_warn
+from ._ui import say as _ui_say
 from .errors import ExtractionError
 from .validate import validate_extraction
 
@@ -77,6 +77,7 @@ def build(
     merged: nx.Graph = graph_cls()
 
     # First pass: collect every node so edge endpoints can be validated.
+    edge_conflicts: list[tuple[str, str, str, str]] = []
     for extraction in extractions:  # type: ignore[assignment]
         errors = validate_extraction(extraction)
         if errors:
@@ -95,21 +96,18 @@ def build(
                 continue  # drop dangling
             relation = edge.get("relation")
             attrs = {k: val for k, val in edge.items() if k not in ("source", "target")}
-            # Deduplicate by (source, target, relation). For a DiGraph we need
-            # a MultiDiGraph to allow multiple relations between the same
-            # pair, but the spec calls for single-edge semantics — last write
-            # wins, keyed on relation. When two extractions disagree on the
-            # relation for the same (src, tgt) pair, the later one wins; we
-            # log a warning so the data loss is visible.
             if merged.has_edge(src, tgt):
                 existing_relation = merged[src][tgt].get("relation")
                 if existing_relation == relation:
                     merged[src][tgt].update(attrs)
                     continue
-                _ui_warn(
-                    f"build: overwriting edge {src} -> {tgt} ({existing_relation} -> {relation})"
-                )
+                edge_conflicts.append((src, tgt, existing_relation or "", relation or ""))
             merged.add_edge(src, tgt, **attrs)
+    if edge_conflicts:
+        _ui_say(
+            f"  Build: {len(edge_conflicts)} conflicting edge relation(s) "
+            f"resolved (last-write wins)"
+        )
     return merged
 
 

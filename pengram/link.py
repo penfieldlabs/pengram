@@ -14,14 +14,17 @@ Linking decisions are cached per-source on disk under
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from . import config as _config
 from . import vocabulary as v
+from ._ui import say as _ui_say
+from ._ui import step as _ui_step
 from ._ui import warn as _ui_warn
 from .llm import LLMError, call_llm, parse_json_response
 from .security import sanitize_filename
@@ -135,6 +138,7 @@ def link_entities(
         .replace("{source_context}", source.context[:2000] or "(no additional context)")
         .replace("{targets}", _format_targets(targets))
     )
+    llm_failed = False
     try:
         response = caller(
             prompt,
@@ -145,6 +149,7 @@ def link_entities(
         data = parse_json_response(response)
     except LLMError:
         data = None
+        llm_failed = True
 
     chosen: dict[int, dict[str, Any]] = {}
     if isinstance(data, dict):
@@ -160,6 +165,11 @@ def link_entities(
 
     decisions: list[LinkDecision] = []
     fallback_relation = _default_relation(source.kind)
+    fallback_reason = (
+        "LLM call failed; default applied"
+        if llm_failed
+        else "LLM did not produce a link; default applied"
+    )
     for i, target in enumerate(targets):
         entry = chosen.get(i)
         if entry is None:
@@ -169,7 +179,7 @@ def link_entities(
                     target=target.id,
                     relation=fallback_relation,
                     confidence=v.CONFIDENCE_AMBIGUOUS,
-                    reason="LLM did not produce a link; default applied",
+                    reason=fallback_reason,
                 )
             )
             continue
@@ -197,6 +207,16 @@ def _cache_path(output_dir: Path, source_id: str) -> Path:
     return output_dir / "links" / f"{sanitize_filename(source_id)}.json"
 
 
+@dataclass
+class LinkStats:
+    """Phase-level counts from :func:`link_all`."""
+
+    total: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    error_classes: Counter[str] = field(default_factory=Counter)
+
+
 def link_all(
     pairs: Iterable[tuple[Entity, list[Entity]]],
     *,
@@ -206,7 +226,7 @@ def link_all(
     workers: int | None = None,
     llm: Callable[..., str] | None = None,
     provider: str | None = None,
-) -> list[LinkDecision]:
+) -> tuple[list[LinkDecision], LinkStats]:
     """Link every ``(source, targets)`` pair with caching and parallelism."""
     output_dir = Path(output_dir)
     (output_dir / "links").mkdir(parents=True, exist_ok=True)
@@ -240,21 +260,65 @@ def link_all(
 
     all_decisions: list[LinkDecision] = []
     pairs = list(pairs)
-    if workers <= 1 or len(pairs) <= 1:
-        for source, targets in pairs:
-            all_decisions.extend(_run(source, targets))
-        return all_decisions
+    total = len(pairs)
+    progress_step = max(1, total // 10) if total else 1
+    completed = 0
+    error_classes: Counter[str] = Counter()
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_run, s, t) for s, t in pairs]
-        for fut in as_completed(futures):
-            all_decisions.extend(fut.result())
-    return all_decisions
+    if workers <= 1 or total <= 1:
+        for source, targets in pairs:
+            try:
+                all_decisions.extend(_run(source, targets))
+            except Exception as exc:
+                error_classes[type(exc).__name__] += 1
+                _ui_warn(f"linking failed for {source.id}: {exc.__class__.__name__}: {exc}")
+            completed += 1
+            if completed % progress_step == 0 or completed == total:
+                _ui_step(completed, total, "Linking")
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_run, s, t): s for s, t in pairs}
+            for fut in as_completed(futures):
+                src = futures[fut]
+                try:
+                    all_decisions.extend(fut.result())
+                except Exception as exc:
+                    error_classes[type(exc).__name__] += 1
+                    _ui_warn(f"linking failed for {src.id}: {exc.__class__.__name__}: {exc}")
+                completed += 1
+                if completed % progress_step == 0 or completed == total:
+                    _ui_step(completed, total, "Linking")
+
+    exception_failed = sum(error_classes.values())
+    llm_failed_sources = {d.source for d in all_decisions if d.reason.startswith("LLM call failed")}
+    failed = exception_failed + len(llm_failed_sources)
+    succeeded = total - failed
+    if failed:
+        parts = []
+        if llm_failed_sources:
+            parts.append(f"{len(llm_failed_sources)} LLM failures (fallback applied)")
+        if exception_failed:
+            breakdown = ", ".join(f"{n} {cls}" for cls, n in error_classes.most_common())
+            parts.append(f"{exception_failed} exceptions ({breakdown})")
+        _ui_say(f"  Linking: {succeeded}/{total} succeeded, {failed} failed — {', '.join(parts)}")
+        if total and failed / total > 0.1:
+            _ui_warn(
+                f"Linking failure rate {failed}/{total} ({100 * failed // total}%) exceeds 10%"
+            )
+
+    stats = LinkStats(
+        total=total,
+        succeeded=succeeded,
+        failed=failed,
+        error_classes=error_classes,
+    )
+    return all_decisions, stats
 
 
 __all__ = [
     "Entity",
     "LinkDecision",
+    "LinkStats",
     "link_entities",
     "link_all",
     "LINK_PROMPT",

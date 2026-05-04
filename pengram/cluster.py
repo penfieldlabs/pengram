@@ -33,7 +33,7 @@ def _leiden_communities(g: nx.Graph) -> list[list[str]] | None:
     except ImportError:
         return None
     try:
-        partition = leiden(g)
+        partition = leiden(g, random_seed=42)
     except Exception as exc:  # pragma: no cover — graspologic runtime issues
         _ui_warn(f"Leiden failed, falling back to Louvain: {exc}")
         return None

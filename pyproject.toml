@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pengram"
-version = "0.1.0"
+version = "0.2.0"
 description = "Parse. Extract. Normalize. Knowledge graphs from raw content."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 authors = [{ name = "Penfield" }]
 keywords = ["knowledge-graph", "entity-extraction", "obsidian", "penfield"]
 classifiers = [

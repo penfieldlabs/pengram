@@ -108,3 +108,15 @@ def test_export_catalog_empty_graph(tmp_path: Path) -> None:
     # Header present, no data rows.
     assert len(rows) == 1
     assert rows[0][0] == "filename"
+
+
+def test_export_catalog_rerun_skips_unchanged(tmp_path: Path) -> None:
+    import time
+
+    g = nx.DiGraph()
+    g.add_node("d", kind="document", label="d", source_path="d.md")
+    path = export_catalog(g, tmp_path)
+    mtime = path.stat().st_mtime_ns
+    time.sleep(0.01)
+    export_catalog(g, tmp_path)
+    assert path.stat().st_mtime_ns == mtime

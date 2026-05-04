@@ -54,8 +54,9 @@ The stages are:
 | `transcribe` | Whisper transcription (local/API) | media path → transcript text |
 | `youtube` | Channel catalog + transcript pulling | channel config → `[VideoMeta]` + transcripts |
 | `extract_ast` | tree-sitter code extraction | path → `{nodes, edges}` |
-| `llm` | Provider abstraction (claude-cli / openai / openrouter) | prompt → text |
+| `llm` | Provider abstraction (claude-cli / openai / openrouter / ollama) | prompt or image → text |
 | `extract_llm` | LLM semantic extraction | `Document → {concepts, summary}` |
+| `extract_image` | Vision-LLM image extraction | `image path → {concepts, summary}` |
 | `link` | LLM relationship typing | `(source, targets)` → `[LinkDecision]` |
 | `build` | NetworkX graph assembly | `[extraction]` → `nx.DiGraph` |
 | `cluster` | Community detection | graph → `{cid: [nodes]}` |
@@ -65,6 +66,10 @@ The stages are:
 | `export_html` | Interactive HTML export | graph → `graph.html` |
 | `export_penfield` | Penfield vault export | graph → `vault-penfield/` |
 | `export_obsidian` | Obsidian vault export | graph → `vault-obsidian/` |
+| `export_common` | Shared vault logic (slugs, thresholds, tags) | used by both vault exporters |
+| `export_catalog` | Catalog export | graph → `catalog.json` |
+| `enrich` | LLM concept enrichment + dedup | graph concepts → enriched definitions + merges |
+| `pipeline` | Semantic extraction orchestration | documents → linked extraction dict |
 | `__main__` | CLI entry point | argv → exit code |
 
 ## Extraction schema

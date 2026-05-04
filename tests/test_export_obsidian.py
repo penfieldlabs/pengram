@@ -129,3 +129,99 @@ def test_obsidian_blank_line_between_body_and_relationships(tmp_path: Path) -> N
     import re
 
     assert not re.search(r"^- [^\n]+\n## ", note, re.MULTILINE)
+
+
+def test_image_document_copies_attachment_and_embeds(tmp_path: Path) -> None:
+    """Image-derived document gets a copied attachment + a resolving embed."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    img = src_dir / "diagram.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+
+    g = nx.DiGraph()
+    g.add_node(
+        "doc:diagram",
+        kind="document",
+        label="diagram.png",
+        summary="A test diagram",
+        body="A test diagram",
+        source_file="diagram.png",
+        source_path="",
+        _abs_source_path=str(img),
+    )
+    g.add_node("c", kind="concept", label="C", mentions=5)
+    g.add_edge("doc:diagram", "c", relation="references", confidence="EXTRACTED")
+
+    vault = export_obsidian(g, tmp_path, thresholds={"concept": 1})
+    note = (vault / "documents" / "diagram-png.md").read_text()
+    assert "![[diagram-png.png]]" in note
+    assert "## Source" in note
+    assert (vault / "documents" / "diagram-png.png").exists()
+    assert img.exists()
+
+
+def test_image_attachment_not_copied_in_penfield(tmp_path: Path) -> None:
+    """Penfield vault gets the summary body but no image embed or copy."""
+    from pengram.export_penfield import export_penfield
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    img = src_dir / "diagram.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+
+    g = nx.DiGraph()
+    g.add_node(
+        "doc:diagram",
+        kind="document",
+        label="diagram.png",
+        summary="A test diagram",
+        body="A test diagram",
+        source_file="diagram.png",
+        source_path="",
+        _abs_source_path=str(img),
+    )
+    g.add_node("c", kind="concept", label="C", mentions=5)
+    g.add_edge("doc:diagram", "c", relation="references", confidence="EXTRACTED")
+
+    vault = export_penfield(g, tmp_path, thresholds={"concept": 1})
+    note = (vault / "documents" / "diagram-png.md").read_text()
+    assert "A test diagram" in note
+    assert "![[" not in note
+    assert not (vault / "documents" / "diagram-png.png").exists()
+
+
+def test_image_attachment_slug_collision(tmp_path: Path) -> None:
+    """Two image docs with the same basename get unique slugs and attachments."""
+    for subdir in ("a", "b"):
+        d = tmp_path / "src" / subdir
+        d.mkdir(parents=True)
+        (d / "img.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50)
+
+    g = nx.DiGraph()
+    g.add_node(
+        "doc:img1",
+        kind="document",
+        label="img.png",
+        body="First",
+        source_file="img.png",
+        source_path="a",
+        _abs_source_path=str(tmp_path / "src" / "a" / "img.png"),
+    )
+    g.add_node(
+        "doc:img2",
+        kind="document",
+        label="img.png",
+        body="Second",
+        source_file="img.png",
+        source_path="b",
+        _abs_source_path=str(tmp_path / "src" / "b" / "img.png"),
+    )
+    g.add_node("c", kind="concept", label="C", mentions=5)
+    g.add_edge("doc:img1", "c", relation="references", confidence="EXTRACTED")
+    g.add_edge("doc:img2", "c", relation="references", confidence="EXTRACTED")
+
+    vault = export_obsidian(g, tmp_path, thresholds={"concept": 1})
+    pngs = sorted(vault.rglob("*.png"))
+    assert len(pngs) == 2
+    names = {p.name for p in pngs}
+    assert len(names) == 2

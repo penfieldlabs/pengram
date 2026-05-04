@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..security import slugify
 from ..vocabulary import CONFIDENCE_EXTRACTED
 
 _CATEGORY_MIN_MEMBERS = 2
@@ -164,7 +165,7 @@ def inject_categories(g, communities: dict[int, list[str]]) -> None:
                 )
             continue
 
-        cat_id = f"category_{cid}"
+        cat_id = f"category_{slugify('-'.join(canonical_key))}"
         g.add_node(
             cat_id,
             label=label,

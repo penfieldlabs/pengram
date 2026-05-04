@@ -10,4 +10,4 @@ from .errors import ConfigError as ConfigError
 from .errors import ExtractionError as ExtractionError
 from .errors import PengramError as PengramError
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

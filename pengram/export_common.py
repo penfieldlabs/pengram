@@ -10,6 +10,8 @@ exporters focused on format-specific rendering.
 
 from __future__ import annotations
 
+import filecmp
+import shutil
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -554,13 +556,114 @@ def render_body(
     return ""
 
 
+_IMAGE_EXTENSIONS: frozenset[str] = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+)
+
+
+def copy_image_attachment(
+    node: Mapping[str, Any],
+    note_dir: Path,
+    slug: str,
+) -> str | None:
+    """Copy the source image into the vault next to the note.
+
+    Returns the slug-suffixed filename for the embed, or ``None`` if
+    the node isn't an image document or the source can't be resolved.
+    """
+    source_file = node.get("source_file") or ""
+    ext = Path(source_file).suffix.lower()
+    if ext not in _IMAGE_EXTENSIONS:
+        return None
+    abs_source = node.get("_abs_source_path")
+    if not abs_source or not Path(abs_source).exists():
+        return None
+    dest_filename = f"{slug}{ext}"
+    dest = note_dir / dest_filename
+    try:
+        copy_if_changed(Path(abs_source), dest)
+    except OSError:
+        return None
+    return dest_filename
+
+
+def write_text_if_changed(path: Path, content: str) -> bool:
+    """Write *content* to *path* only if the file is new or different.
+
+    Returns ``True`` when a write occurred, ``False`` when skipped.
+    """
+    if path.exists():
+        try:
+            if path.read_text(encoding="utf-8") == content:
+                return False
+        except OSError:
+            pass
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def purge_stale_files(
+    vault: Path,
+    written: set[Path],
+    *,
+    extensions: frozenset[str] = frozenset({".md"}),
+) -> int:
+    """Remove files under *vault* whose suffix is in *extensions* but
+    whose resolved path is not in *written*.
+
+    After removing files, prunes empty directories bottom-up (but never
+    the vault root itself).
+
+    Returns the count of files deleted.
+    """
+    removed = 0
+    for path in sorted(vault.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in extensions:
+            continue
+        if path in written:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    for dirpath in sorted(
+        (d for d in vault.rglob("*") if d.is_dir()),
+        reverse=True,
+    ):
+        if dirpath == vault:
+            continue
+        try:
+            dirpath.rmdir()
+        except OSError:
+            continue
+    return removed
+
+
+def copy_if_changed(src: Path, dest: Path) -> bool:
+    """Copy *src* to *dest* only if *dest* is missing or differs.
+
+    Returns ``True`` when a copy occurred, ``False`` when skipped.
+    """
+    if dest.exists() and filecmp.cmp(str(src), str(dest), shallow=False):
+        return False
+    shutil.copy2(src, dest)
+    return True
+
+
 __all__ = [
     "DEFAULT_THRESHOLDS",
     "NoteSpec",
     "build_slug_map",
+    "copy_if_changed",
+    "copy_image_attachment",
     "extract_metadata",
     "format_frontmatter",
     "included_nodes",
     "note_type_of",
+    "purge_stale_files",
     "render_body",
+    "write_text_if_changed",
 ]

@@ -3,19 +3,19 @@
 """Audio/video transcription via Whisper.
 
 Dispatches to local faster-whisper or the OpenAI Whisper API based on
-:mod:`pengram.config`. Transcripts are cached per-file so re-runs skip
-already-transcribed media.
+:mod:`pengram.config`. Each media file produces a plain-text
+``.transcript`` sidecar next to the source. If the sidecar already
+exists, Whisper is skipped — the file IS the cache.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from . import config as _config
+from ._ui import say as _ui_say
 from ._ui import warn as _ui_warn
-from .cache import load_cached, save_cached
 from .errors import ConfigError
 
 _FASTER_WHISPER_HINT = (
@@ -43,9 +43,9 @@ def build_domain_prompt(god_nodes: Iterable[str] | None = None) -> str:
     return f"{_DEFAULT_DOMAIN_PROMPT} Prominent topics in this corpus include: {hint}."
 
 
-def _transcribe_cache_key(media_path: Path) -> Path:
-    """Return a .json path adjacent to the media file used as a crash-safe sidecar."""
-    return media_path.with_suffix(media_path.suffix + ".transcript.json")
+def _transcript_path(media_path: Path) -> Path:
+    """Return the ``.transcript`` sidecar path for a media file."""
+    return media_path.with_suffix(".transcript")
 
 
 def transcribe_local(
@@ -130,47 +130,45 @@ def transcribe(
 def transcribe_all(
     media_files: Iterable[Path],
     *,
-    cache_root: Path | None = None,
     transcriber: Callable[[Path], str] | None = None,
     prompt: str | None = None,
-) -> dict[Path, str]:
-    """Transcribe a batch of media files with caching.
+) -> list[Path]:
+    """Transcribe a batch of media files, writing ``.transcript`` sidecars.
 
-    Results are cached under ``cache_root/.pengram-cache/``. Individual
-    transcripts are also written next to the media file as
-    ``<media>.<ext>.transcript.json`` so a crash does not lose work.
+    Each media file produces a plain-text ``<stem>.transcript`` file
+    next to the source. If the sidecar already exists, Whisper is
+    skipped — the file IS the cache. Deleting the sidecar triggers
+    re-transcription on the next run.
+
+    Returns the list of transcript file paths (both pre-existing and
+    newly written).
     """
-    results: dict[Path, str] = {}
-    root = cache_root or _config.OUTPUT_DIR
+    transcript_paths: list[Path] = []
+    already = 0
     for media in media_files:
-        cached = load_cached(root, media) if cache_root else None
-        if cached and isinstance(cached, dict) and "text" in cached:
-            results[media] = cached["text"]
+        tp = _transcript_path(media)
+        if tp.exists():
+            already += 1
+            transcript_paths.append(tp)
             continue
-        sidecar = _transcribe_cache_key(media)
-        if sidecar.exists():
-            try:
-                with open(sidecar, encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and "text" in data:
-                    results[media] = data["text"]
-                    if cache_root:
-                        save_cached(root, media, data)
-                    continue
-            except (OSError, json.JSONDecodeError) as exc:
-                _ui_warn(f"transcript sidecar unreadable for {media}: {exc}")
         runner = transcriber or (lambda p: transcribe(p, prompt=prompt))
-        text = runner(media)
-        payload = {"text": text, "source": str(media)}
         try:
-            with open(sidecar, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
+            text = runner(media)
+        except Exception as exc:
+            _ui_warn(f"transcription failed for {media}: {exc}")
+            continue
+        try:
+            tp.write_text(text, encoding="utf-8")
         except OSError as exc:
-            _ui_warn(f"transcript sidecar write failed for {media}: {exc}")
-        if cache_root:
-            save_cached(root, media, payload)
-        results[media] = text
-    return results
+            _ui_warn(f"transcript write failed for {media}: {exc}")
+            continue
+        transcript_paths.append(tp)
+    wrote = len(transcript_paths) - already
+    if wrote:
+        _ui_say(f"  Whisper: wrote {wrote} transcript(s)")
+    elif already:
+        _ui_say(f"  Whisper: {already} transcript(s) already exist, skipped")
+    return transcript_paths
 
 
 __all__ = [

@@ -89,3 +89,15 @@ def test_cache_is_content_addressed(tmp_path: Path) -> None:
     cache.save_cached(tmp_path, a, {"origin": "a"})
     # Same content → same cache key, so we read a's stored result for b
     assert cache.load_cached(tmp_path, b) == {"origin": "a"}
+
+
+def test_content_hash_cache_excludes_underscore_keys(tmp_path: Path) -> None:
+    src = tmp_path / "x.md"
+    src.write_text("x" * 100)
+    cache.save_cached(tmp_path, src, {"_source": "/secret/x.md", "_doc_id": "x.md", "concepts": []})
+    cached_file = next(p for p in (tmp_path / ".pengram-cache").iterdir())
+    text = cached_file.read_text()
+    assert "/secret" not in text
+    assert "_source" not in text
+    assert "_doc_id" not in text
+    assert "concepts" in text

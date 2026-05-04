@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from . import config as _config
+from ._tools import resolve_tool
+from ._ui import step as _ui_step
 from ._ui import warn as _ui_warn
 from .config import YouTubeChannel
 from .security import SecurityError, validate_url, validate_video_id
@@ -87,6 +89,10 @@ class TranscriptResult:
 class YouTubeClient:
     """Thin wrapper around the yt-dlp CLI, injectable in tests."""
 
+    _YT_DLP_HINT = (
+        "yt-dlp is required for the YouTube pipeline. Install with: pip install 'pengram[youtube]'"
+    )
+
     def __init__(
         self,
         *,
@@ -94,6 +100,7 @@ class YouTubeClient:
         runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
     ) -> None:
         self.proxy = proxy
+        self._custom_runner = runner is not None
         self._runner = runner or self._default_runner
 
     @staticmethod
@@ -107,7 +114,11 @@ class YouTubeClient:
         )
 
     def _base_args(self) -> list[str]:
-        args = ["yt-dlp"]
+        if self._custom_runner:
+            cmd = "yt-dlp"
+        else:
+            cmd = resolve_tool("yt-dlp", install_hint=self._YT_DLP_HINT)
+        args = [cmd]
         if self.proxy:
             args += ["--proxy", self.proxy]
         return args
@@ -155,13 +166,12 @@ class YouTubeClient:
                 url,
             ]
         )
-        if result.returncode != 0:
-            stderr = (result.stderr or "").lower()
-            if "sign in" in stderr or "429" in stderr or "rate" in stderr:
-                raise RuntimeError("rate_limited: " + stderr[:200])
-            raise RuntimeError(stderr[:200] or "yt-dlp returned non-zero")
         for candidate in out_dir.glob(f"{video_id}*.vtt"):
             return candidate
+        if result.returncode != 0:
+            stderr = (result.stderr or "").lower()
+            if "sign in" in stderr or "429" in stderr:
+                raise RuntimeError("rate_limited: " + (result.stderr or "")[:200])
         return None
 
 
@@ -412,15 +422,21 @@ def pull_all_transcripts(
     client = client or YouTubeClient(proxy=_config.PROXY)
     work_dir = work_dir or (_config.OUTPUT_DIR / "transcripts")
     work_dir.mkdir(parents=True, exist_ok=True)
+    items = list(catalog)
+    total = len(items)
     state: dict[str, TranscriptResult] = {}
     if state_file and state_file.exists():
         try:
             raw = json.loads(state_file.read_text(encoding="utf-8"))
             for vid, payload in raw.items():
+                status = payload.get("status", "error")
+                if status in {"rate_limited", "error"}:
+                    transcript = work_dir / f"{vid}.transcript"
+                    status = "ok" if transcript.exists() else "no_subtitles"
                 state[vid] = TranscriptResult(
                     video_id=vid,
                     text=payload.get("text"),
-                    status=payload.get("status", "error"),
+                    status=status,
                     error=payload.get("error"),
                 )
         except (OSError, json.JSONDecodeError) as exc:
@@ -433,7 +449,6 @@ def pull_all_transcripts(
         try:
             payload = {
                 vid: {
-                    "text": r.text,
                     "status": r.status,
                     "error": r.error,
                 }
@@ -444,18 +459,33 @@ def pull_all_transcripts(
         except OSError as exc:
             _ui_warn(f"transcript state file write failed: {exc}")
 
+    progress_step = max(1, total // 10) if total else 1
+    processed = 0
     fetched = 0
-    for meta in catalog:
+
+    def _tick() -> None:
+        if processed % progress_step == 0 and processed < total:
+            _ui_step(processed, total, "Transcripts")
+
+    for meta in items:
         if max_videos is not None and fetched >= max_videos:
             break
         prior = state.get(meta.video_id)
         if prior and prior.status == "ok":
+            processed += 1
+            _tick()
             continue
         if prior and not prior.is_transient and prior.status != "error":
+            processed += 1
+            _tick()
             continue
-        # Transient failures retry on every new run — the 3-retry backoff
-        # resets per invocation.
+        transcript_existed = (work_dir / f"{meta.video_id}.transcript").exists()
         result = pull_transcript(meta, client=client, work_dir=work_dir)
+        if result.status == "ok" and not prior and transcript_existed:
+            state[meta.video_id] = result
+            processed += 1
+            _tick()
+            continue
         if result.is_transient and retry_transient:
             for attempt, delay in enumerate(_RETRY_DELAYS, 1):
                 _ui_warn(
@@ -472,9 +502,15 @@ def pull_all_transcripts(
                     break
         state[meta.video_id] = result
         fetched += 1
+        processed += 1
         _persist()
+        _tick()
         if sleep_between > 0:
             sleeper(sleep_between)
+    if processed:
+        _ui_step(processed, total, "Transcripts")
+    if state:
+        _persist()
     return state
 
 

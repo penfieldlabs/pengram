@@ -102,3 +102,28 @@ def test_export_json_handles_path_objects(tmp_path: Path) -> None:
     out = export_json(g, tmp_path)
     data = json.loads(out.read_text())
     assert data["nodes"][0]["source_path"] == "/tmp/file.md"
+
+
+def test_export_json_excludes_internal_underscore_keys(tmp_path: Path) -> None:
+    """Underscore-prefixed attributes are pipeline-internal and must not
+    leak into graph.json (e.g. _abs_source_path on image-derived nodes)."""
+    g = nx.DiGraph()
+    g.add_node(
+        "doc:img",
+        kind="document",
+        label="img.png",
+        source_file="img.png",
+        _abs_source_path="/private/build/secret/img.png",
+    )
+    g.add_node("c", kind="concept", label="C", mentions=5)
+    g.add_edge("doc:img", "c", relation="references", _internal_meta="x")
+
+    p = export_json(g, tmp_path)
+    text = p.read_text()
+    data = json.loads(text)
+
+    node = next(n for n in data["nodes"] if n["id"] == "doc:img")
+    assert "_abs_source_path" not in node
+    edge = data["edges"][0]
+    assert "_internal_meta" not in edge
+    assert "/private/build/secret" not in text

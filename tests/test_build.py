@@ -114,8 +114,8 @@ def test_build_empty() -> None:
     assert len(g.edges) == 0
 
 
-def test_build_warns_when_overwriting_edge_relation(capsys) -> None:
-    """Different relations on the same (src, tgt) pair must warn via _ui."""
+def test_build_summarises_conflicting_edge_relations(capsys) -> None:
+    """Different relations on the same (src, tgt) pair produce a summary line."""
     a = {
         "nodes": [{"id": "A", "label": "A"}, {"id": "B", "label": "B"}],
         "edges": [
@@ -124,7 +124,7 @@ def test_build_warns_when_overwriting_edge_relation(capsys) -> None:
         ],
     }
     g = build([a])
-    # Last write wins (contradicts overwrites supports).
     assert g["a"]["b"]["relation"] == "contradicts"
-    # And we warned about the overwrite.
-    assert "overwriting edge" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "1 conflicting edge relation(s) resolved" in out
+    assert "overwriting edge" not in out

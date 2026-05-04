@@ -179,6 +179,82 @@ def test_youtube_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert calls == {"catalog": 1, "transcripts": 1}
 
 
+def _youtube_summary_test(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys,
+    results: dict,
+) -> str:
+    """Helper: run cmd_youtube with canned TranscriptResults, return stdout."""
+    from pengram.config import YouTubeChannel
+    from pengram.youtube import VideoMeta
+
+    channel = YouTubeChannel(url="https://youtube.com/@x", label="X")
+    monkeypatch.setattr("pengram.config.YOUTUBE_CHANNELS", {"x": channel}, raising=False)
+    catalog = [
+        VideoMeta(video_id=vid, title=f"V{i}", url="", channel="X", tab="videos")
+        for i, vid in enumerate(results)
+    ]
+
+    import pengram.youtube as yt_mod
+
+    monkeypatch.setattr(yt_mod, "pull_catalog", lambda ch, client=None: catalog)
+    monkeypatch.setattr(yt_mod, "pull_all_transcripts", lambda cat, **kw: results)
+
+    code = main(["--output", str(tmp_path / "out"), "youtube", "x"])
+    assert code == 0
+    return capsys.readouterr().out
+
+
+def test_youtube_summary_all_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    from pengram.youtube import TranscriptResult
+
+    results = {f"v{i}": TranscriptResult(f"v{i}", "text", "ok") for i in range(5)}
+    out = _youtube_summary_test(monkeypatch, tmp_path, capsys, results)
+    assert "5/5 pulled" in out
+    assert "Skipped" not in out
+
+
+def test_youtube_summary_all_no_subtitles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    from pengram.youtube import TranscriptResult
+
+    results = {f"v{i}": TranscriptResult(f"v{i}", None, "no_subtitles") for i in range(3)}
+    out = _youtube_summary_test(monkeypatch, tmp_path, capsys, results)
+    assert "0/3 pulled" in out
+    assert "No videos have captions" in out
+    assert "Whisper" in out
+
+
+def test_youtube_summary_rate_limited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    from pengram.youtube import TranscriptResult
+
+    results = {
+        "v0": TranscriptResult("v0", "text", "ok"),
+        "v1": TranscriptResult("v1", None, "rate_limited"),
+    }
+    out = _youtube_summary_test(monkeypatch, tmp_path, capsys, results)
+    assert "1/2 pulled" in out
+    assert "rate limiting" in out
+
+
+def test_youtube_summary_mixed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    from pengram.youtube import TranscriptResult
+
+    results = {
+        "v0": TranscriptResult("v0", "text", "ok"),
+        "v1": TranscriptResult("v1", None, "no_subtitles"),
+        "v2": TranscriptResult("v2", None, "error", "boom"),
+    }
+    out = _youtube_summary_test(monkeypatch, tmp_path, capsys, results)
+    assert "1/3 pulled" in out
+    assert "no_subtitles" in out
+    assert "error" in out
+
+
 def _write_graph_json(tmp_path: Path) -> Path:
     graph = {
         "meta": {"nodes": 2, "edges": 1, "communities": 1, "directed": True, "version": "0.1"},
@@ -474,6 +550,58 @@ def test_cli_pipeline_emits_non_extracted_confidence(
     data = json.loads((out_dir / "graph.json").read_text())
     confidences = {e.get("confidence") for e in data["edges"]}
     assert "INFERRED" in confidences
+
+
+def test_extract_h1_title_basic() -> None:
+    from pengram.cli import _extract_h1_title
+
+    assert _extract_h1_title("# My Article\n\nBody text") == "My Article"
+
+
+def test_extract_h1_title_with_frontmatter() -> None:
+    from pengram.cli import _extract_h1_title
+
+    text = "---\ntitle: x\n---\n# Real Title\n\nBody"
+    assert _extract_h1_title(text) == "Real Title"
+
+
+def test_extract_h1_title_no_h1_returns_none() -> None:
+    from pengram.cli import _extract_h1_title
+
+    assert _extract_h1_title("Just plain text.\nNo heading here.") is None
+
+
+def test_extract_h1_title_strips_whitespace() -> None:
+    from pengram.cli import _extract_h1_title
+
+    assert _extract_h1_title("#   Padded Title  \n\nbody") == "Padded Title"
+
+
+def test_extract_h1_title_single_line_no_newline() -> None:
+    from pengram.cli import _extract_h1_title
+
+    assert _extract_h1_title("# Solo Title") == "Solo Title"
+
+
+def test_extract_h1_title_special_chars_preserved() -> None:
+    from pengram.cli import _extract_h1_title
+
+    assert _extract_h1_title("# Hello / World & Friends\n\nbody") == "Hello / World & Friends"
+
+
+def test_cli_document_label_uses_h1_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Documents with an H1 heading should use it as the label."""
+    _install_pipeline_mocks(monkeypatch)
+    (tmp_path / "notes.md").write_text("# Some Article Title\n\n" + "content " * 300)
+    out_dir = tmp_path / "out"
+    main(["--output", str(out_dir), "run", str(tmp_path)])
+    data = json.loads((out_dir / "graph.json").read_text())
+    doc_nodes = [n for n in data["nodes"] if n.get("kind") == "document"]
+    assert doc_nodes
+    assert doc_nodes[0]["label"] == "Some Article Title"
 
 
 def test_cli_document_labels_are_filenames_not_full_paths(
@@ -1621,8 +1749,116 @@ def test_inject_categories_bigger_cluster_wins_cat_id() -> None:
 
     cat_ids = [nid for nid, data in g.nodes(data=True) if data.get("kind") == "category"]
     assert len(cat_ids) == 1
-    # Bigger community (cid=7) wins the cat_id.
-    assert cat_ids[0] == "category_7"
+    # cat_id is derived from sorted concept labels, not community integer.
+    assert cat_ids[0] == "category_x-y-z"
+
+
+def test_inject_categories_id_stable_when_topk_unchanged() -> None:
+    """Category ID is derived from sorted top-K concept labels, so adding
+    a new community elsewhere must not shift existing category IDs."""
+    import networkx as nx
+
+    from pengram.orchestrate.inject import inject_categories as _inject_categories
+
+    def _build_graph_with_communities(community_map):
+        g = nx.DiGraph()
+        for nid, label in (("c_a", "Alpha"), ("c_b", "Beta")):
+            g.add_node(nid, kind="concept", label=label, mentions=5)
+        for nid, label in (("c_x", "Xray"), ("c_y", "Yankee")):
+            g.add_node(nid, kind="concept", label=label, mentions=3)
+        for cid, members in community_map.items():
+            for m in members:
+                if not g.has_node(m):
+                    g.add_node(m, kind="document", label=m, source_path=f"{m}.md", body="t")
+        for m in community_map.get(0, []):
+            for c in ("c_a", "c_b"):
+                g.add_edge(m, c, relation="references", confidence="EXTRACTED")
+        for m in community_map.get(1, []):
+            for c in ("c_x", "c_y"):
+                g.add_edge(m, c, relation="references", confidence="EXTRACTED")
+        return g
+
+    run1_communities = {0: ["d0", "d1"], 1: ["d2", "d3"]}
+    g1 = _build_graph_with_communities(run1_communities)
+    _inject_categories(g1, run1_communities)
+    ids_run1 = sorted(nid for nid, d in g1.nodes(data=True) if d.get("kind") == "category")
+
+    run2_communities = {0: ["d0", "d1"], 1: ["d2", "d3"], 2: ["d4", "d5"]}
+    g2 = _build_graph_with_communities(run2_communities)
+    for nid in ("c_p", "c_q"):
+        g2.add_node(nid, kind="concept", label=nid.upper(), mentions=2)
+    for m in ("d4", "d5"):
+        for c in ("c_p", "c_q"):
+            g2.add_edge(m, c, relation="references", confidence="EXTRACTED")
+    _inject_categories(g2, run2_communities)
+    ids_run2 = sorted(nid for nid, d in g2.nodes(data=True) if d.get("kind") == "category")
+
+    assert set(ids_run1).issubset(set(ids_run2))
+    for cat_id in ids_run1:
+        assert cat_id in ids_run2
+
+
+def test_inject_categories_id_changes_when_topk_changes() -> None:
+    """If the top-K concepts change, the category ID must change too."""
+    import networkx as nx
+
+    from pengram.orchestrate.inject import inject_categories as _inject_categories
+
+    g1 = nx.DiGraph()
+    for nid, label in (("c_a", "Alpha"), ("c_b", "Beta")):
+        g1.add_node(nid, kind="concept", label=label, mentions=5)
+    for i in range(3):
+        g1.add_node(f"d{i}", kind="document", label=f"d{i}", source_path=f"d{i}.md", body="t")
+        for c in ("c_a", "c_b"):
+            g1.add_edge(f"d{i}", c, relation="references", confidence="EXTRACTED")
+    _inject_categories(g1, {0: ["d0", "d1", "d2"]})
+    ids1 = [nid for nid, d in g1.nodes(data=True) if d.get("kind") == "category"]
+
+    g2 = nx.DiGraph()
+    for nid, label in (("c_x", "Xray"), ("c_y", "Yankee")):
+        g2.add_node(nid, kind="concept", label=label, mentions=5)
+    for i in range(3):
+        g2.add_node(f"d{i}", kind="document", label=f"d{i}", source_path=f"d{i}.md", body="t")
+        for c in ("c_x", "c_y"):
+            g2.add_edge(f"d{i}", c, relation="references", confidence="EXTRACTED")
+    _inject_categories(g2, {0: ["d0", "d1", "d2"]})
+    ids2 = [nid for nid, d in g2.nodes(data=True) if d.get("kind") == "category"]
+
+    assert len(ids1) == 1
+    assert len(ids2) == 1
+    assert ids1[0] != ids2[0]
+
+
+def test_inject_categories_same_input_deterministic() -> None:
+    """Running inject_categories twice with identical input produces
+    identical category node IDs — full determinism check."""
+    import networkx as nx
+
+    from pengram.orchestrate.inject import inject_categories as _inject_categories
+
+    def _build():
+        g = nx.DiGraph()
+        for nid, label in (("c1", "Concept1"), ("c2", "Concept2"), ("c3", "Concept3")):
+            g.add_node(nid, kind="concept", label=label, mentions=10)
+        for i in range(4):
+            g.add_node(
+                f"doc_{i}", kind="document", label=f"Doc {i}", source_path=f"d{i}.md", body="x"
+            )
+            for c in ("c1", "c2", "c3"):
+                g.add_edge(f"doc_{i}", c, relation="references", confidence="EXTRACTED")
+        communities = {0: [f"doc_{i}" for i in range(4)]}
+        _inject_categories(g, communities)
+        return sorted(
+            [
+                (nid, data.get("label"), sorted(data.get("members", [])))
+                for nid, data in g.nodes(data=True)
+                if data.get("kind") == "category"
+            ]
+        )
+
+    run_a = _build()
+    run_b = _build()
+    assert run_a == run_b
 
 
 def test_cli_category_parents_concepts_from_member_docs(
@@ -1767,3 +2003,299 @@ def test_cli_pipeline_is_idempotent_across_output_dirs(
     edges2 = sorted((e["source"], e["target"], e["relation"]) for e in g2["edges"])
     assert ids1 == ids2
     assert edges1 == edges2
+
+
+def test_cli_warm_rerun_produces_identical_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cold run + warm rerun into the same output dir must produce
+    bit-identical graph.json and GRAPH_REPORT.md (idempotency contract)."""
+    _install_pipeline_mocks(monkeypatch)
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "notes.md").write_text("Alpha Beta graphs " * 300)
+
+    out_dir = tmp_path / "out"
+
+    # Cold run.
+    main(["--output", str(out_dir), "run", str(input_dir)])
+    graph_cold = (out_dir / "graph.json").read_text()
+    report_cold = (out_dir / "GRAPH_REPORT.md").read_text()
+
+    # Warm rerun (everything cache-hits).
+    main(["--output", str(out_dir), "run", str(input_dir)])
+    graph_warm = (out_dir / "graph.json").read_text()
+    report_warm = (out_dir / "GRAPH_REPORT.md").read_text()
+
+    assert graph_cold == graph_warm, "graph.json differs between cold and warm run"
+    assert report_cold == report_warm, "GRAPH_REPORT.md differs between cold and warm run"
+
+
+def test_cli_whisper_transcription_wired_into_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audio files trigger Whisper transcription and LLM extraction."""
+    _install_pipeline_mocks(monkeypatch)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    audio = input_dir / "lecture.mp3"
+    audio.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * 200)
+
+    transcribe_called = False
+
+    def fake_transcribe_all(media_files, **kw):
+        nonlocal transcribe_called
+        transcribe_called = True
+        # Write a .transcript sidecar so the doc extraction path picks it up
+        paths = []
+        for media in media_files:
+            tp = media.with_suffix(".transcript")
+            tp.write_text("Graphs and trees are fundamental data structures. " * 20)
+            paths.append(tp)
+        return paths
+
+    import pengram.transcribe
+
+    monkeypatch.setattr(pengram.transcribe, "transcribe_all", fake_transcribe_all)
+
+    out_dir = tmp_path / "out"
+    code = main(["--output", str(out_dir), "run", str(input_dir), "--yes"])
+    assert code == 0
+    assert transcribe_called
+    assert (out_dir / "graph.json").exists()
+
+
+def test_cli_image_extraction_wired_into_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Image files trigger vision-LLM extraction."""
+    _install_pipeline_mocks(monkeypatch)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    img = input_dir / "diagram.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 200)
+
+    extract_called = False
+
+    def fake_extract_images(image_paths, **kw):
+        nonlocal extract_called
+        extract_called = True
+        paths = list(image_paths)
+        return [
+            {
+                "concepts": [
+                    {"name": "graphs", "mentions": 4, "note": "A diagram of graphs."},
+                ],
+                "summary": "Diagram of graphs.",
+                "_doc_id": f"image:{paths[0].name}",
+                "_source": str(paths[0]),
+            }
+        ]
+
+    import pengram.extract_image as ei_mod
+
+    monkeypatch.setattr(ei_mod, "extract_images", fake_extract_images)
+
+    out_dir = tmp_path / "out"
+    code = main(["--output", str(out_dir), "run", str(input_dir)])
+    assert code == 0
+    assert extract_called
+    assert (out_dir / "graph.json").exists()
+
+
+def test_cli_image_notes_have_summary_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Image-derived document notes get the summary as body text."""
+    _install_pipeline_mocks(monkeypatch)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    img = input_dir / "diagram.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 200)
+
+    def fake_extract_images(image_paths, **kw):
+        paths = list(image_paths)
+        return [
+            {
+                "concepts": [
+                    {"name": "graphs", "mentions": 4, "note": "A diagram of graphs."},
+                ],
+                "summary": "A visual representation of graph structures.",
+                "_doc_id": f"image:{paths[0].name}",
+                "_source": str(paths[0]),
+            }
+        ]
+
+    import pengram.extract_image as ei_mod
+
+    monkeypatch.setattr(ei_mod, "extract_images", fake_extract_images)
+
+    out_dir = tmp_path / "out"
+    code = main(["--output", str(out_dir), "run", str(input_dir)])
+    assert code == 0
+
+    # Penfield vault: summary as body, no image embed
+    pen_notes = list((out_dir / "vault-penfield" / "documents").rglob("*.md"))
+    assert pen_notes
+    pen_body = pen_notes[0].read_text()
+    assert "A visual representation of graph structures." in pen_body
+    assert "![[" not in pen_body
+
+
+def test_cli_image_obsidian_vault_copies_attachment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Obsidian vault copies source image and embeds it with slug-named filename."""
+    _install_pipeline_mocks(monkeypatch)
+    monkeypatch.setattr("pengram.config.OUTPUT_TARGET", "obsidian", raising=False)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    img = input_dir / "diagram.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 200)
+
+    def fake_extract_images(image_paths, **kw):
+        paths = list(image_paths)
+        return [
+            {
+                "concepts": [
+                    {"name": "graphs", "mentions": 4, "note": "A diagram of graphs."},
+                ],
+                "summary": "A visual representation of graph structures.",
+                "_doc_id": f"image:{paths[0].name}",
+                "_source": str(paths[0]),
+            }
+        ]
+
+    import pengram.extract_image as ei_mod
+
+    monkeypatch.setattr(ei_mod, "extract_images", fake_extract_images)
+
+    out_dir = tmp_path / "out"
+    code = main(["--output", str(out_dir), "run", str(input_dir)])
+    assert code == 0
+
+    obs_notes = list((out_dir / "vault-obsidian" / "documents").rglob("*.md"))
+    assert obs_notes
+    obs_body = obs_notes[0].read_text()
+    assert "A visual representation of graph structures." in obs_body
+    assert "## Source" in obs_body
+    assert "![[diagram-png.png]]" in obs_body
+    assert (obs_notes[0].parent / "diagram-png.png").exists()
+
+
+def test_cli_yes_flag_skips_deps_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--yes / -y skips the interactive deps prompt entirely."""
+    import builtins
+    from typing import Any
+
+    _install_pipeline_mocks(monkeypatch)
+
+    real_import = builtins.__import__
+
+    def blocked_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "faster_whisper":
+            raise ImportError("not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    audio = input_dir / "lecture.mp3"
+    audio.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * 200)
+    (input_dir / "notes.md").write_text("graphs and trees " * 200)
+
+    prompt_called = False
+
+    def explode(_prompt: str) -> str:
+        nonlocal prompt_called
+        prompt_called = True
+        return "y"
+
+    monkeypatch.setattr("builtins.input", explode)
+
+    out_dir = tmp_path / "out"
+    code = main(["--output", str(out_dir), "run", str(input_dir), "--yes"])
+    assert code == 0
+    assert not prompt_called
+
+
+def test_cli_eoferror_defaults_to_continue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EOFError (piped stdin) defaults to continue, not abort."""
+    import builtins
+    from typing import Any
+
+    _install_pipeline_mocks(monkeypatch)
+
+    real_import = builtins.__import__
+
+    def blocked_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "faster_whisper":
+            raise ImportError("not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    audio = input_dir / "lecture.mp3"
+    audio.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * 200)
+    (input_dir / "notes.md").write_text("graphs and trees " * 200)
+
+    def eof_input(_prompt: str) -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof_input)
+
+    out_dir = tmp_path / "out"
+    code = main(["--output", str(out_dir), "run", str(input_dir)])
+    assert code == 0
+
+
+def test_check_optional_deps_empty_when_no_media() -> None:
+    from pengram.cli import _check_optional_deps
+    from pengram.detect import FileType
+
+    groups: dict[FileType, list[Path]] = {
+        FileType.DOCUMENT: [Path("notes.md")],
+        FileType.CODE: [Path("main.py")],
+    }
+    assert _check_optional_deps(groups) == []
+
+
+def test_check_optional_deps_reports_missing_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+    from typing import Any
+
+    from pengram.cli import _check_optional_deps
+    from pengram.detect import FileType
+
+    real_import = builtins.__import__
+
+    def blocked_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "pypdf":
+            raise ImportError("no pypdf")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    groups: dict[FileType, list[Path]] = {
+        FileType.DOCUMENT: [Path("paper.pdf")],
+    }
+    missing = _check_optional_deps(groups)
+    assert any("PDF" in line for line in missing)
+    assert any("pengram[pdf]" in line for line in missing)

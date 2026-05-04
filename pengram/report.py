@@ -91,6 +91,20 @@ def render_report(
         lines.append("_None._")
     lines.append("")
 
+    health = analysis.get("pipeline_health") or []
+    if health:
+        lines.append("## Pipeline Health")
+        lines.append("")
+        lines.append("| Phase | Total | Succeeded | Empty | Failed |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for entry in health:
+            total = entry.get("total", 0)
+            succeeded = entry.get("succeeded", 0)
+            empty = entry.get("empty", 0)
+            failed = entry.get("failed", 0)
+            lines.append(f"| {entry['phase']} | {total} | {succeeded} | {empty} | {failed} |")
+        lines.append("")
+
     return "\n".join(lines)
 
 

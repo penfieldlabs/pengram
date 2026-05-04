@@ -16,6 +16,10 @@ reserved for the relationship vocabulary.
 
 penfield-import reads relationships from frontmatter only, so the note body
 never contains a ``## Relationships`` section in this export.
+
+The export is **idempotent**: given the same graph input, re-running into
+the same output directory produces byte-identical vault files. Stale notes
+(from entities that were removed upstream) are purged automatically.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from pathlib import Path
 
 import networkx as nx
 
+from ._ui import step as _ui_step
 from .export_common import (
     DEFAULT_THRESHOLDS,
     NoteSpec,
@@ -36,7 +41,9 @@ from .export_common import (
     format_frontmatter,
     included_nodes,
     note_type_of,
+    purge_stale_files,
     render_body,
+    write_text_if_changed,
 )
 
 
@@ -72,9 +79,11 @@ def export_penfield(
     included = included_nodes(g, thresholds)
     slug_map = build_slug_map(g, included)
 
-    for node_id in g.nodes:
-        if node_id not in included:
-            continue
+    written: set[Path] = set()
+    included_list = [nid for nid in g.nodes if nid in included]
+    total = len(included_list)
+    progress_step = max(1, total // 10) if total else 1
+    for i, node_id in enumerate(included_list, 1):
         node = g.nodes[node_id]
         note_type = note_type_of(node)
         metadata = extract_metadata(node, note_type, slug_map=slug_map, node_id=node_id, g=g)
@@ -101,7 +110,13 @@ def export_penfield(
         subdir = _subdir_for(vault, note_type, node)
         subdir.mkdir(parents=True, exist_ok=True)
         file_path = subdir / f"{slug_map[node_id]}.md"
-        file_path.write_text(render_note(spec), encoding="utf-8")
+        write_text_if_changed(file_path, render_note(spec))
+        written.add(file_path)
+        if i % progress_step == 0 and i < total:
+            _ui_step(i, total, "Export (Penfield)")
+    if total:
+        _ui_step(total, total, "Export (Penfield)")
+    purge_stale_files(vault, written)
     return vault
 
 

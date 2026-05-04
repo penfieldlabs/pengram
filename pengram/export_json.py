@@ -23,6 +23,8 @@ from typing import Any
 
 import networkx as nx
 
+from .export_common import write_text_if_changed
+
 GRAPH_JSON_VERSION = "0.1"
 
 
@@ -33,10 +35,16 @@ def to_dict(
 ) -> dict[str, Any]:
     """Return a JSON-serialisable dict representation of the graph."""
     directed = isinstance(g, nx.DiGraph)
-    nodes = [{"id": n, **g.nodes[n]} for n in g.nodes]
+    nodes = [
+        {"id": n, **{k: v for k, v in g.nodes[n].items() if not k.startswith("_")}} for n in g.nodes
+    ]
     edges = []
     for u, v, data in g.edges(data=True):
-        edge: dict[str, Any] = {"source": u, "target": v, **data}
+        edge: dict[str, Any] = {
+            "source": u,
+            "target": v,
+            **{k: val for k, val in data.items() if not k.startswith("_")},
+        }
         # "relation" is canonical internally; "relationship" aliases it
         # for external consumers (e.g. Penfield import, graph viewers).
         if "relation" in edge and "relationship" not in edge:
@@ -79,8 +87,8 @@ def export_json(
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = to_dict(g, communities, analysis)
     path = output_dir / filename
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True, default=_json_default)
+    content = json.dumps(payload, indent=2, sort_keys=True, default=_json_default)
+    write_text_if_changed(path, content)
     return path
 
 

@@ -188,6 +188,55 @@ def test_canonicalize_skips_unnamed() -> None:
     assert result["concepts"] == []
 
 
+def test_canonicalize_merges_plurals() -> None:
+    """Plural variants should merge during canonicalization, not wait for enrichment."""
+    extractions = [
+        {"concepts": [{"name": "Belief", "mentions": 5}]},
+        {"concepts": [{"name": "Beliefs", "mentions": 2}]},
+    ]
+    result = canonicalize_entities(extractions)
+    assert len(result["concepts"]) == 1
+    assert result["concepts"][0]["mentions"] == 7
+    assert result["concepts"][0]["name"] == "Belief"
+
+
+def test_canonicalize_merges_hyphens() -> None:
+    """Hyphenated and non-hyphenated forms should merge."""
+    extractions = [
+        {"concepts": [{"name": "machine learning", "mentions": 3}]},
+        {"concepts": [{"name": "machine-learning", "mentions": 1}]},
+    ]
+    result = canonicalize_entities(extractions)
+    assert len(result["concepts"]) == 1
+    assert result["concepts"][0]["mentions"] == 4
+    assert result["concepts"][0]["name"] == "machine learning"
+
+
+def test_canonicalize_keeps_highest_mention_form() -> None:
+    """When merging fuzzy variants, the form with more mentions wins."""
+    extractions = [
+        {"concepts": [{"name": "DNA", "mentions": 2}]},
+        {"concepts": [{"name": "dna", "mentions": 5}]},
+    ]
+    result = canonicalize_entities(extractions)
+    assert len(result["concepts"]) == 1
+    assert result["concepts"][0]["name"] == "dna"
+
+
+def test_canonicalize_keeps_semantically_distinct_concepts() -> None:
+    """Fuzzy dedup must NOT merge distinct concepts that share a substring."""
+    extractions = [
+        {"concepts": [{"name": "Inflation", "mentions": 5}]},
+        {"concepts": [{"name": "Consumer Price Inflation", "mentions": 3}]},
+        {"concepts": [{"name": "Apollo", "mentions": 2}]},
+        {"concepts": [{"name": "Apollo Target", "mentions": 4}]},
+    ]
+    result = canonicalize_entities(extractions)
+    names = {c["name"] for c in result["concepts"]}
+    assert names == {"Inflation", "Consumer Price Inflation", "Apollo", "Apollo Target"}
+    assert len(result["concepts"]) == 4
+
+
 def test_extract_many_sorted_by_doc_id(tmp_path: Path) -> None:
     """Results must be returned in stable doc_id order regardless of thread timing."""
 
@@ -456,6 +505,42 @@ def test_extract_many_content_hash_cache_miss_on_edit(tmp_path: Path) -> None:
     assert calls["n"] == 2
 
 
+def test_extraction_dump_excludes_internal_underscore_keys(tmp_path: Path) -> None:
+    src = tmp_path / "x.md"
+    src.write_text("x" * 100)
+    doc = Document(doc_id="x.md", text="x" * 100, source=str(src))
+
+    def fake_llm(prompt: str, **kw: Any) -> str:
+        return json.dumps({"concepts": [], "summary": ""})
+
+    extract_many([doc], output_dir=tmp_path, workers=1, llm=fake_llm)
+    dump = tmp_path / "extractions" / "x.md.json"
+    assert dump.exists()
+    text = dump.read_text()
+    assert "_source" not in text
+    assert "_doc_id" not in text
+    assert str(src) not in text
+
+
+def test_cache_reload_repopulates_source_and_doc_id(tmp_path: Path) -> None:
+    src = tmp_path / "x.md"
+    src.write_text("x" * 100)
+    doc = Document(doc_id="x.md", text="x" * 100, source=str(src))
+
+    def fake_llm(prompt: str, **kw: Any) -> str:
+        return json.dumps({"concepts": [], "summary": ""})
+
+    def fail_llm(prompt: str, **kw: Any) -> str:
+        raise AssertionError("LLM should not be called on cache hit")
+
+    extract_many([doc], output_dir=tmp_path / "out1", cache_root=tmp_path, workers=1, llm=fake_llm)
+    results = extract_many(
+        [doc], output_dir=tmp_path / "out2", cache_root=tmp_path, workers=1, llm=fail_llm
+    )
+    assert results[0]["_doc_id"] == "x.md"
+    assert results[0]["_source"] == str(src)
+
+
 def test_merge_rejects_short_and_numeric_concept_names() -> None:
     from pengram.extract_llm import _merge_chunk_extractions
 
@@ -476,3 +561,146 @@ def test_merge_rejects_short_and_numeric_concept_names() -> None:
     assert "ai" in names
     assert "42" not in names
     assert "x" not in names
+
+
+# ---------------------------------------------------------------------------
+# _coerce_mentions
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_mentions_int_passthrough() -> None:
+    from pengram.extract_llm import _coerce_mentions
+
+    assert _coerce_mentions(5) == 5
+    assert _coerce_mentions(1) == 1
+
+
+def test_coerce_mentions_clamps_zero_and_negative() -> None:
+    from pengram.extract_llm import _coerce_mentions
+
+    assert _coerce_mentions(0) == 1
+    assert _coerce_mentions(-3) == 1
+
+
+def test_coerce_mentions_float_truncated() -> None:
+    from pengram.extract_llm import _coerce_mentions
+
+    assert _coerce_mentions(3.7) == 3
+    assert _coerce_mentions(1.0) == 1
+    assert _coerce_mentions(0.5) == 1
+
+
+def test_coerce_mentions_string_numeric() -> None:
+    from pengram.extract_llm import _coerce_mentions
+
+    assert _coerce_mentions("4") == 4
+    assert _coerce_mentions("2.9") == 2
+    assert _coerce_mentions("0") == 1
+
+
+def test_coerce_mentions_string_non_numeric() -> None:
+    from pengram.extract_llm import _coerce_mentions
+
+    assert _coerce_mentions("many") == 1
+    assert _coerce_mentions("") == 1
+    assert _coerce_mentions("N/A") == 1
+
+
+def test_coerce_mentions_none_and_bool() -> None:
+    from pengram.extract_llm import _coerce_mentions
+
+    assert _coerce_mentions(None) == 1
+    assert _coerce_mentions(True) == 1
+    assert _coerce_mentions(False) == 1
+
+
+def test_coerce_mentions_non_scalar() -> None:
+    from pengram.extract_llm import _coerce_mentions
+
+    assert _coerce_mentions({"count": 3}) == 1
+    assert _coerce_mentions([1, 2, 3]) == 1
+    assert _coerce_mentions(()) == 1
+
+
+def test_coerce_mentions_inf_and_nan() -> None:
+    from pengram.extract_llm import _coerce_mentions
+
+    assert _coerce_mentions(float("inf")) == 1
+    assert _coerce_mentions(float("-inf")) == 1
+    assert _coerce_mentions(float("nan")) == 1
+
+
+def test_merge_chunk_extractions_coerces_adversarial_mentions() -> None:
+    """String/None/dict mentions in per-chunk results must not crash merge."""
+    from pengram.extract_llm import _merge_chunk_extractions
+
+    chunks = [
+        {
+            "concepts": [
+                {"name": "Alpha", "mentions": "3"},
+                {"name": "Beta", "mentions": None},
+            ],
+            "summary": "c1",
+        },
+        {
+            "concepts": [
+                {"name": "Alpha", "mentions": {"count": 5}},
+                {"name": "Beta", "mentions": -2},
+            ],
+            "summary": "c2",
+        },
+    ]
+    merged = _merge_chunk_extractions(chunks)
+    by_name = {c["name"]: c for c in merged["concepts"]}
+    assert by_name["Alpha"]["mentions"] == 4  # 3 + 1 (dict→1)
+    assert by_name["Beta"]["mentions"] == 2  # 1 (None→1) + 1 (neg→1)
+    assert all(isinstance(c["mentions"], int) for c in merged["concepts"])
+
+
+def test_canonicalize_coerces_adversarial_mentions() -> None:
+    """LLM returning string/None/dict mentions must not crash or corrupt totals."""
+    extractions = [
+        {
+            "concepts": [
+                {"name": "Alpha", "mentions": "3"},
+                {"name": "Beta", "mentions": None},
+                {"name": "Gamma", "mentions": {"count": 5}},
+            ]
+        },
+        {
+            "concepts": [
+                {"name": "Alpha", "mentions": 2.7},
+                {"name": "Beta", "mentions": -1},
+            ]
+        },
+    ]
+    result = canonicalize_entities(extractions)
+    by_name = {c["name"]: c for c in result["concepts"]}
+    assert by_name["Alpha"]["mentions"] == 5  # 3 + 2
+    assert by_name["Beta"]["mentions"] == 2  # 1 + 1
+    assert by_name["Gamma"]["mentions"] == 1
+    assert all(isinstance(c["mentions"], int) for c in result["concepts"])
+
+
+def test_extract_many_emits_failure_summary_on_errors(tmp_path: Path, capsys: Any) -> None:
+    """When some docs fail extraction, a summary line must appear."""
+    from pengram.llm import LLMError
+
+    calls = {"n": 0}
+
+    def flaky_llm(prompt: str, **kw: Any) -> str:
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            raise LLMError("transient glitch")
+        return json.dumps({"concepts": [{"name": "Alpha", "mentions": 1}], "summary": "ok"})
+
+    docs = [
+        Document(doc_id="fail", text="will fail " * 30, source="/fake/fail.md"),
+        Document(doc_id="ok", text="will succeed " * 30, source="/fake/ok.md"),
+    ]
+    results = extract_many(docs, output_dir=tmp_path, workers=1, llm=flaky_llm)
+    assert len(results) == 1
+    out = capsys.readouterr().out
+    assert "1/2 succeeded" in out
+    assert "1 failed" in out
+    assert "LLMError" in out

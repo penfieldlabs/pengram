@@ -26,7 +26,13 @@ PENgram uses a three-pass architecture:
 
 All extractions are content-hashed (SHA256) and cached on disk, so re-runs
 only reprocess what changed. Per-document and per-entity LLM calls are
-written to disk as they complete — a crash resumes cleanly.
+written to disk as they complete, so a crash resumes cleanly.
+
+**Idempotent vs reproducible.** Re-running PENgram on unchanged input
+produces identical output (idempotent). But the pipeline is not
+byte-reproducible across machines or model versions — LLM responses are
+inherently non-deterministic, so a fresh extraction of the same content
+may produce slightly different entities and edges.
 
 ## Quick start
 
@@ -44,9 +50,14 @@ cat pengram-out/GRAPH_REPORT.md # god nodes, surprising connections, questions
 | Code (25 languages) | `.py` `.js` `.ts` `.go` `.rs` `.java` `.c` `.cpp` `.rb` `.cs` `.kt` `.scala` `.php` `.swift` `.lua` `.zig` `.ps1` `.ex` `.m` `.jl` `.dart` `.v` `.vue` `.svelte` ... | tree-sitter (deterministic) |
 | Documents | `.md` `.txt` `.rst` `.html` `.pdf` `.epub` | LLM (pypdf / ebooklib when needed) |
 | YouTube | channel URLs | yt-dlp (captions) |
-| Audio/Video | `.mp3` `.wav` `.mp4` `.mov` `.webm` ... | faster-whisper or OpenAI API |
+| Audio/Video | `.mp3` `.wav` `.mp4` `.mov` `.webm` ... | Whisper transcription (local or OpenAI API) → LLM extraction |
 | Transcripts | `.transcript` `.vtt` `.srt` | pass-through (YouTube pipeline writes `.transcript`) |
-| Images | `.png` `.jpg` ... | detected in v0.1, extracted in v0.3+ |
+| Images | `.png` `.jpg` `.gif` `.webp` `.bmp` `.tif` ... | vision LLM (entity extraction from visual content) |
+
+**Tip — image-heavy corpora:** Each image yields `mentions: 1` per concept
+(one image = one occurrence). The default vault threshold is 3 mentions, so
+image-only projects may produce a graph but no vault notes. Pass
+`--threshold-concept 1` to keep every extracted concept.
 
 ## Output formats
 
@@ -57,6 +68,26 @@ cat pengram-out/GRAPH_REPORT.md # god nodes, surprising connections, questions
 | `GRAPH_REPORT.md` | yes | God nodes, surprising connections, questions |
 | `vault-penfield/` | when `OUTPUT_TARGET=penfield` or `both` | Penfield-compliant vault |
 | `vault-obsidian/` | when `OUTPUT_TARGET=obsidian` or `both` | Obsidian vault with wikilink-types |
+
+## Pipeline health
+
+`GRAPH_REPORT.md` includes a Pipeline Health table showing success, empty,
+and failure counts for each processing phase:
+
+```
+## Pipeline Health
+
+| Phase        | Total | Succeeded | Empty | Failed |
+| ---          | ---   | ---       | ---   | ---    |
+| Extraction   | 42    | 38        | 3     | 1      |
+| Linking      | 127   | 124       | 0     | 3      |
+| Enrichment   | 89    | 87        | 2     | 0      |
+| Transcripts  | 500   | 483       | 0     | 17     |
+```
+
+"Empty" means the phase ran but produced no output (e.g. a document with
+no extractable entities). "Failed" means the phase threw an error (LLM
+timeout, network failure). Failed documents are retried on the next run.
 
 ## PENgram + Penfield
 
@@ -132,6 +163,52 @@ pengram youtube mychannel --max-videos 10
 The YouTube pipeline accesses only publicly available metadata and captions.
 No cookies or authentication tokens are used. A default 2-second delay is
 inserted between requests to stay well within rate limits.
+
+**No captions?** Some channels have no auto-generated or manual captions
+(common for IR/corporate channels). `pengram youtube` will report this
+as `no_subtitles`. To extract content from uncaptioned videos, download
+the audio manually and feed it through the regular ingest pipeline:
+
+```bash
+yt-dlp -x --audio-format m4a -o "input/%(title)s.%(ext)s" <channel-url>
+pengram run input/
+```
+
+Whisper (local via `pengram[video]` or via OpenAI API) will transcribe.
+
+### Transcript workflow
+
+The YouTube pipeline writes one `.transcript` file per video into
+`pengram-out/transcripts/`. These files are the user-facing contract:
+
+- **Edit a `.transcript` file** to correct OCR errors, remove filler, or
+  add annotations. On the next run, PENgram re-extracts entities from
+  your edited text (the content hash changed) but does not re-download.
+- **Delete a `.transcript` file** to force a fresh download and VTT
+  cleaning pass.
+- **Leave it alone** and PENgram skips both download and extraction
+  (content unchanged, cache hit).
+
+Each `.transcript` includes YAML frontmatter (video ID, title, views,
+upload date) followed by the cleaned transcript text.
+
+### YouTube video states
+
+The state file (`pengram-out/transcripts/_state.json`) tracks each
+video's transcript status:
+
+| Status | Meaning | Retried? |
+|---|---|---|
+| `ok` | Transcript downloaded and cleaned | no |
+| `no_subtitles` | Video has no captions (auto or manual) | no |
+| `empty_after_cleaning` | Captions existed but contained no usable text | no |
+| `rate_limited` | YouTube returned 429 or sign-in gate | yes (next run) |
+| `timeout` | yt-dlp timed out | yes (next run) |
+| `error` | Other failure | yes (next run) |
+
+Stale `rate_limited` and `error` entries are automatically reclassified
+on load: if the `.transcript` file exists on disk, the status becomes
+`ok`; otherwise `no_subtitles`.
 
 **Default: `videos` only.** To pull more, add tabs explicitly:
 

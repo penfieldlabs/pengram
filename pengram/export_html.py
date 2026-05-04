@@ -17,6 +17,7 @@ from typing import Any
 
 import networkx as nx
 
+from .export_common import write_text_if_changed
 from .vocabulary import SEMANTIC_TYPES, STRUCTURAL_TYPES
 
 _VIS_CDN = "https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"
@@ -361,7 +362,7 @@ def export_html(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / filename
-    path.write_text(render_html(g, communities, title=title), encoding="utf-8")
+    write_text_if_changed(path, render_html(g, communities, title=title))
     return path
 
 

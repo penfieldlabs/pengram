@@ -13,11 +13,20 @@ Three-phase pipeline — the same prompts work for any content type
 
 Each per-document extraction is persisted as a JSON file under
 ``output_dir/extractions/<doc_id>.json`` so a crash resumes cleanly.
+
+**Idempotent vs reproducible:** Re-running against the same output
+directory is a no-op — content-hash caching means unchanged files are
+never re-sent to the LLM. However, two runs *without* a shared cache
+(or after cache invalidation) are **not** guaranteed to produce
+bit-identical results: LLM output is non-deterministic even at
+temperature 0.
 """
 
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -26,6 +35,7 @@ from typing import Any
 
 from . import cache as _cache
 from . import config as _config
+from ._ui import say as _ui_say
 from ._ui import step as _ui_step
 from ._ui import warn as _ui_warn
 from .llm import LLMError, call_llm, parse_json_response
@@ -140,10 +150,11 @@ def _merge_chunk_extractions(per_chunk: list[dict[str, Any]]) -> dict[str, Any]:
             existing = merged.get(key)
             if existing is None:
                 merged[key] = dict(entity)
+                merged[key]["mentions"] = _coerce_mentions(entity.get("mentions"))
             else:
-                existing["mentions"] = (existing.get("mentions", 1) or 1) + (
-                    entity.get("mentions", 1) or 1
-                )
+                existing["mentions"] = _coerce_mentions(
+                    existing.get("mentions")
+                ) + _coerce_mentions(entity.get("mentions"))
                 new_note = str(entity.get("note") or "")
                 old_note = str(existing.get("note") or "")
                 if len(new_note) > len(old_note):
@@ -248,8 +259,9 @@ def extract_many(
 
     def _dump_extraction(doc_id: str, result: dict[str, Any]) -> None:
         try:
+            clean = {k: v for k, v in result.items() if not k.startswith("_")}
             _extraction_path(output_dir, doc_id).write_text(
-                json.dumps(result, indent=2),
+                json.dumps(clean, indent=2),
                 encoding="utf-8",
             )
         except OSError:
@@ -267,7 +279,9 @@ def extract_many(
         # actually re-run the LLM.
         if has_content_cache:
             cached = _cache.load_cached(cache_root, source_path)  # type: ignore[arg-type]
-            if isinstance(cached, dict) and cached.get("_doc_id"):
+            if isinstance(cached, dict):
+                cached["_doc_id"] = doc.doc_id
+                cached["_source"] = doc.source
                 cached = _fold_legacy_events(cached)
                 _dump_extraction(doc.doc_id, cached)
                 return cached
@@ -277,7 +291,10 @@ def extract_many(
             dump = _extraction_path(output_dir, doc.doc_id)
             if dump.exists():
                 try:
-                    return _fold_legacy_events(json.loads(dump.read_text(encoding="utf-8")))
+                    cached = json.loads(dump.read_text(encoding="utf-8"))
+                    cached["_doc_id"] = doc.doc_id
+                    cached["_source"] = doc.source
+                    return _fold_legacy_events(cached)
                 except (OSError, json.JSONDecodeError):
                     pass
 
@@ -300,8 +317,10 @@ def extract_many(
     total = len(docs)
     progress_step = max(1, total // 10) if total else 1
     completed = 0
+    error_classes: Counter[str] = Counter()
 
     def _warn(doc: Document, exc: BaseException) -> None:
+        error_classes[type(exc).__name__] += 1
         _ui_warn(f"extraction failed for {doc.doc_id}: {exc.__class__.__name__}: {exc}")
 
     def _tick() -> None:
@@ -328,9 +347,61 @@ def extract_many(
                     _warn(doc, exc)
                 _tick()
 
+    failed = sum(error_classes.values())
+    empty = sum(1 for r in results if not r.get("concepts"))
+    succeeded = len(results) - empty
+    if failed or empty:
+        parts = [f"{succeeded}/{total} succeeded"]
+        if empty:
+            parts.append(f"{empty} empty")
+        if failed:
+            breakdown = ", ".join(f"{n} {cls}" for cls, n in error_classes.most_common())
+            parts.append(f"{failed} failed ({breakdown})")
+        _ui_say(f"  Extraction: {', '.join(parts)}")
+        if total and failed / total > 0.1:
+            _ui_warn(
+                f"Extraction failure rate {failed}/{total} ({100 * failed // total}%) exceeds 10%"
+            )
+
     # Deterministic ordering, independent of thread-completion order.
     results.sort(key=lambda r: r.get("_doc_id") or "")
     return results
+
+
+def _coerce_mentions(value: Any) -> int:
+    """Coerce an LLM-provided mentions value to a positive int.
+
+    LLMs occasionally return strings (``"3"``), floats (``2.0``),
+    ``None``, negatives, or non-scalar types for the ``mentions``
+    field. This normalises all of those to ``max(int(value), 1)``.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(value, 1)
+    if isinstance(value, float):
+        try:
+            return max(int(value), 1)
+        except (ValueError, OverflowError):
+            return 1
+    if isinstance(value, str):
+        try:
+            return max(int(float(value)), 1)
+        except (ValueError, OverflowError):
+            return 1
+    return 1
+
+
+def _fuzzy_key(name: str) -> str:
+    """Normalise a concept name for surface-form dedup.
+
+    Collapses case, hyphens/whitespace, and trailing plural 's'.
+    Matches the enrichment-pass ``_normalize_for_dedup`` so upstream
+    dedup catches the same variants.
+    """
+    s = name.strip().lower()
+    s = re.sub(r"[-\s]+", "", s)
+    if len(s) > 3 and s.endswith("s") and not s.endswith("ss"):
+        s = s[:-1]
+    return s
 
 
 def canonicalize_entities(
@@ -343,10 +414,11 @@ def canonicalize_entities(
     """Return a dict of canonicalised entity lists keyed by kind.
 
     The only extracted kind is ``concepts``. Merging is deterministic:
-    exact-match (case-insensitive) name collisions combine mentions.
+    fuzzy-key collisions (case, hyphens, trailing plural 's') combine
+    mentions, keeping the highest-mention surface form as canonical.
     ``llm``, ``model`` and ``timeout`` are accepted for API symmetry
     with the other extraction-phase helpers but are unused — the v0.2
-    enrichment pass does the fuzzier surface-form dedup.
+    enrichment pass does any remaining fuzzier dedup.
 
     Legacy ``events`` arrays (from before the kill-events directive)
     are folded into concepts on the way in so cached extractions still
@@ -359,16 +431,22 @@ def canonicalize_entities(
         for entity in extraction.get("concepts", []):
             if not isinstance(entity, dict):
                 continue
-            key = (entity.get("name") or "").strip().lower()
+            raw_name = (entity.get("name") or "").strip()
+            if not raw_name:
+                continue
+            key = _fuzzy_key(raw_name)
             if not key:
                 continue
             existing = merged.get(key)
             if existing is None:
                 merged[key] = dict(entity)
+                merged[key]["mentions"] = _coerce_mentions(entity.get("mentions"))
             else:
-                existing["mentions"] = (existing.get("mentions", 1) or 1) + (
-                    entity.get("mentions", 1) or 1
-                )
+                incoming = _coerce_mentions(entity.get("mentions"))
+                prev = _coerce_mentions(existing.get("mentions"))
+                existing["mentions"] = prev + incoming
+                if incoming > prev:
+                    existing["name"] = raw_name
     return {"concepts": list(merged.values())}
 
 

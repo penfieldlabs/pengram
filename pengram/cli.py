@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from . import __version__, cache, extract_ast, extract_llm
+from . import __version__, cache, extract_ast, extract_image, extract_llm
 from . import config as _config
 from . import detect as _detect
 from . import enrich as _enrich
@@ -25,6 +26,7 @@ from .analyze import analyze
 from .build import build
 from .cluster import cluster
 from .export_catalog import export_catalog
+from .export_common import write_text_if_changed
 from .export_html import export_html
 from .export_json import export_json
 from .export_obsidian import export_obsidian
@@ -64,6 +66,24 @@ def _parse_transcript_meta(path: Path) -> dict[str, Any]:
     return fm
 
 
+def _extract_h1_title(text: str) -> str | None:
+    """Return the first H1 heading from a markdown body, if any."""
+    in_frontmatter = False
+    for line in text.split("\n", 50):
+        s = line.strip()
+        if not s:
+            continue
+        if s == "---":
+            in_frontmatter = not in_frontmatter
+            continue
+        if in_frontmatter:
+            continue
+        if s.startswith("# "):
+            return s[2:].strip() or None
+        return None
+    return None
+
+
 def _read_document_text(path: Path, file_type: _detect.FileType) -> str:
     """Return plain text for a document or transcript file.
 
@@ -86,6 +106,72 @@ def _read_document_text(path: Path, file_type: _detect.FileType) -> str:
 
         text = strip_frontmatter(text)
     return text
+
+
+def _check_optional_deps(
+    groups: dict[_detect.FileType, list[Path]],
+    *,
+    use_llm: bool = True,
+) -> list[str]:
+    """Probe for missing optional dependencies based on detected file types.
+
+    Returns a list of human-readable warning lines (empty if nothing is missing).
+    Audio/video and image checks are skipped when ``use_llm`` is False because
+    those pipelines require LLM and won't run anyway.
+    """
+    missing: list[str] = []
+
+    has_pdf = any(p.suffix.lower() == ".pdf" for p in groups.get(_detect.FileType.DOCUMENT, []))
+    if has_pdf:
+        try:
+            import pypdf  # noqa: F401
+        except ImportError:
+            missing.append("PDF files detected — install with: pip install 'pengram[pdf]'")
+
+    has_epub = any(p.suffix.lower() == ".epub" for p in groups.get(_detect.FileType.DOCUMENT, []))
+    if has_epub:
+        try:
+            import bs4  # noqa: F401
+            import ebooklib  # noqa: F401
+        except ImportError:
+            missing.append("EPUB files detected — install with: pip install 'pengram[epub]'")
+
+    if not use_llm:
+        return missing
+
+    av_files = groups.get(_detect.FileType.AUDIO, []) + groups.get(_detect.FileType.VIDEO, [])
+    if av_files:
+        whisper_mode = _config.WHISPER_MODE
+        if whisper_mode == "local":
+            try:
+                import faster_whisper  # noqa: F401
+            except ImportError:
+                missing.append(
+                    f"{len(av_files)} audio/video files detected — install with: "
+                    "pip install 'pengram[video]' (or set PENGRAM_WHISPER_MODE=openai)"
+                )
+        elif whisper_mode in ("openai", "openrouter"):
+            try:
+                import openai  # noqa: F401
+            except ImportError:
+                missing.append(
+                    f"{len(av_files)} audio/video files detected — install with: "
+                    "pip install 'pengram[openai]'"
+                )
+
+    image_files = groups.get(_detect.FileType.IMAGE, [])
+    if image_files:
+        provider = _config.LLM_PROVIDER
+        if provider in ("openai", "openrouter"):
+            try:
+                import openai  # noqa: F401
+            except ImportError:
+                missing.append(
+                    f"{len(image_files)} image files detected — install with: "
+                    "pip install 'pengram[openai]'"
+                )
+
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +202,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 extract_model=detected if rc.extract_model == "_auto" else rc.extract_model,
                 link_model=detected if rc.link_model == "_auto" else rc.link_model,
                 synth_model=detected if rc.synth_model == "_auto" else rc.synth_model,
+                image_model=detected if rc.image_model == "_auto" else rc.image_model,
                 extract_timeout=rc.extract_timeout,
                 link_timeout=rc.link_timeout,
                 synth_timeout=rc.synth_timeout,
@@ -130,7 +217,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     total = sum(len(files) for files in groups.values())
     say(f"  {total} files classified across {len(groups)} types")
 
+    missing = _check_optional_deps(groups, use_llm=use_llm)
+    if missing:
+        warn("Some file types require optional dependencies that are not installed:")
+        for line in missing:
+            warn(f"  {line}")
+        warn("Files of these types will be skipped.")
+        if not args.yes:
+            try:
+                answer = input("Continue anyway? [Y/n] ").strip().lower()
+            except EOFError:
+                answer = ""
+            except KeyboardInterrupt:
+                return _error("Aborted.")
+            if answer and answer != "y":
+                return _error("Aborted — install dependencies and retry.")
+
     extractions: list[dict[str, Any]] = []
+    pipeline_health: list[dict[str, Any]] = []
 
     code_files = groups.get(_detect.FileType.CODE, [])
     if code_files:
@@ -152,6 +256,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         cache.save_cached(root, code_path, result)
         extractions.append(result)
 
+    # --- Whisper transcription (must run BEFORE doc extraction) ---
+    av_files = groups.get(_detect.FileType.AUDIO, []) + groups.get(_detect.FileType.VIDEO, [])
+    if av_files and use_llm:
+        say(f"  Whisper transcription: {len(av_files)} audio/video files")
+        try:
+            from . import transcribe as _transcribe
+
+            transcript_paths = _transcribe.transcribe_all(av_files)
+            existing = set(groups.get(_detect.FileType.TRANSCRIPT, []))
+            for tp in transcript_paths:
+                if tp not in existing:
+                    groups.setdefault(_detect.FileType.TRANSCRIPT, []).append(tp)
+        except ImportError as exc:
+            warn(f"Whisper transcription skipped: {exc}")
+    elif av_files and not use_llm:
+        say(f"  Whisper transcription skipped (--no-llm). {len(av_files)} files ignored.")
+
     doc_like: list[tuple[Path, _detect.FileType]] = []
     for ftype in (_detect.FileType.DOCUMENT, _detect.FileType.TRANSCRIPT):
         for p in groups.get(ftype, []):
@@ -167,6 +288,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             meta: dict[str, Any] = {"file_type": ftype.value}
             if ftype == _detect.FileType.TRANSCRIPT:
                 meta.update(_parse_transcript_meta(path))
+            elif ftype == _detect.FileType.DOCUMENT:
+                h1 = _extract_h1_title(text)
+                if h1:
+                    meta["title"] = h1
             documents.append(
                 Document(
                     doc_id=str(path.relative_to(root)),
@@ -189,6 +314,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             except ImportError as exc:
                 warn(f"LLM extraction skipped: {exc}")
                 llm_results = []
+            doc_failed = len(documents) - len(llm_results)
+            doc_empty = sum(1 for r in llm_results if not r.get("concepts"))
+            doc_succeeded = len(llm_results) - doc_empty
+            if doc_failed or doc_empty or llm_results:
+                pipeline_health.append(
+                    {
+                        "phase": "Extraction",
+                        "total": len(documents),
+                        "succeeded": doc_succeeded,
+                        "empty": doc_empty,
+                        "failed": doc_failed,
+                    }
+                )
             if llm_results:
                 say(
                     f"  Canonicalize + link: {sum(len(r.get(k, [])) for r in llm_results for k, _ in _ENTITY_KINDS)} raw entities"
@@ -207,17 +345,55 @@ def cmd_run(args: argparse.Namespace) -> int:
     elif doc_like and not use_llm:
         say(f"  LLM extraction skipped (--no-llm). {len(doc_like)} documents ignored.")
 
-    media_count = (
-        len(groups.get(_detect.FileType.AUDIO, []))
-        + len(groups.get(_detect.FileType.VIDEO, []))
-        + len(groups.get(_detect.FileType.IMAGE, []))
-    )
-    if media_count:
-        say(f"  {media_count} audio/video/image files detected (extraction in v0.2+).")
+    # --- Image extraction via vision LLM ---
+    image_files = groups.get(_detect.FileType.IMAGE, [])
+    if image_files and use_llm:
+        say(f"  Image extraction: {len(image_files)} image files")
+        try:
+            img_results = extract_image.extract_images(
+                image_files,
+                output_dir=output_dir,
+                cache_root=root,
+                model=rc.image_model,
+                provider=rc.provider,
+            )
+            if img_results:
+                extractions.append(
+                    build_semantic_extraction(
+                        img_results,
+                        output_dir=output_dir,
+                        run_linker=True,
+                        link_model=rc.link_model,
+                        link_timeout=rc.link_timeout,
+                        provider=rc.provider,
+                    )
+                )
+        except (ImportError, LLMError) as exc:
+            warn(f"Image extraction skipped: {exc}")
+    elif image_files and not use_llm:
+        say(f"  Image extraction skipped (--no-llm). {len(image_files)} files ignored.")
 
     if not extractions:
         say("Nothing to extract. Exiting cleanly.")
         return 0
+
+    link_total = link_succeeded = link_failed = 0
+    for ext in extractions:
+        ls = ext.pop("_link_stats", None)
+        if ls is not None:
+            link_total += ls.total
+            link_succeeded += ls.succeeded
+            link_failed += ls.failed
+    if link_total:
+        pipeline_health.append(
+            {
+                "phase": "Linking",
+                "total": link_total,
+                "succeeded": link_succeeded,
+                "empty": 0,
+                "failed": link_failed,
+            }
+        )
 
     say(f"  {len(extractions)} extractions; building graph...")
     g = build(extractions)
@@ -233,13 +409,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         if concept_count:
             say(f"  Enrichment: {concept_count} concepts (use --no-enrich to skip)")
             try:
-                enrich_results = _enrich.enrich_concepts(
+                enrich_results, enrich_stats = _enrich.enrich_concepts(
                     g,
                     communities,
                     model=args.enrich_model or rc.synth_model,
                     cache_dir=enrichment_cache_dir,
                     provider=rc.provider,
                 )
+                if enrich_stats.total:
+                    pipeline_health.append(
+                        {
+                            "phase": "Enrichment",
+                            "total": enrich_stats.total,
+                            "succeeded": enrich_stats.succeeded,
+                            "empty": enrich_stats.empty,
+                            "failed": enrich_stats.failed,
+                        }
+                    )
                 merges, enriched = _enrich.apply_enrichment(g, enrich_results)
                 if merges or enriched:
                     say(
@@ -259,12 +445,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     inject_categories(g, communities)
 
     analysis = analyze(g, communities)
+    if pipeline_health:
+        analysis["pipeline_health"] = pipeline_health
 
     export_json(g, output_dir, communities=communities, analysis=analysis)
     export_html(g, output_dir, communities=communities)
-    (output_dir / "GRAPH_REPORT.md").write_text(
+    write_text_if_changed(
+        output_dir / "GRAPH_REPORT.md",
         _report.render_report(g, analysis, communities),
-        encoding="utf-8",
     )
 
     from .export_penfield import DEFAULT_THRESHOLDS as _DEFAULT_VAULT_THRESHOLDS
@@ -365,14 +553,34 @@ def cmd_youtube(args: argparse.Namespace) -> int:
     say(f"  {len(catalog)} videos")
     state_file = output_dir / "transcripts" / f"{channel_key}.state.json"
     max_videos: int = args.max_videos
-    pull_all_transcripts(
+    state = pull_all_transcripts(
         catalog,
         work_dir=output_dir / "transcripts",
         state_file=state_file,
         sleep_between=2.0,
         max_videos=max_videos,
     )
-    say(f"Transcripts written under {output_dir / 'transcripts'}")
+    counts = Counter(r.status for r in state.values())
+    ok = counts.get("ok", 0)
+    total = sum(counts.values())
+    say(f"Transcripts: {ok}/{total} pulled (under {output_dir / 'transcripts'})")
+    if ok < total:
+        breakdown = ", ".join(f"{n} {s}" for s, n in counts.most_common() if s != "ok")
+        if breakdown:
+            say(f"  Skipped/failed: {breakdown}")
+        if counts.get("no_subtitles", 0) == total:
+            say(
+                "  No videos have captions. For uncaptioned channels, download "
+                "audio with yt-dlp (`yt-dlp -x --audio-format m4a <url>`) into "
+                "your input dir and run `pengram run <input>` — Whisper will "
+                "transcribe locally or via API."
+            )
+        elif counts.get("rate_limited", 0) > 0:
+            say(
+                "  Some videos hit YouTube's rate limiting. Wait a few hours "
+                "or set PENGRAM_PROXY and re-run; transient failures are "
+                "retried automatically."
+            )
     return 0
 
 
@@ -405,9 +613,9 @@ def cmd_export(args: argparse.Namespace) -> int:
         export_html(g, output_dir, communities=communities)
     elif fmt == "report":
         analysis = data.get("analysis") or analyze(g, communities)
-        (output_dir / "GRAPH_REPORT.md").write_text(
+        write_text_if_changed(
+            output_dir / "GRAPH_REPORT.md",
             _report.render_report(g, analysis, communities),
-            encoding="utf-8",
         )
     else:
         return _error(f"Unknown format: {fmt}")
@@ -560,6 +768,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="MODEL",
         help="override the LLM model used for enrichment (defaults to LLM.synth_model)",
+    )
+    run.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="answer yes to all interactive prompts (e.g. missing optional deps)",
     )
     run.set_defaults(func=cmd_run)
 

@@ -121,7 +121,6 @@ IMAGE_EXTENSIONS: frozenset[str] = frozenset(
         ".jpeg",
         ".gif",
         ".webp",
-        ".svg",
         ".bmp",
         ".tif",
         ".tiff",
@@ -147,8 +146,6 @@ AUDIO_EXTENSIONS: frozenset[str] = frozenset(
         ".m4a",
         ".ogg",
         ".flac",
-        ".aac",
-        ".opus",
     }
 )
 

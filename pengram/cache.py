@@ -62,8 +62,9 @@ def save_cached(root: Path, path: Path, result: dict[str, Any]) -> None:
         cdir = _cache_dir(root)
         cdir.mkdir(parents=True, exist_ok=True)
         cpath = _cache_path(root, path)
+        clean = {k: v for k, v in result.items() if not k.startswith("_")}
         with open(cpath, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, sort_keys=True)
+            json.dump(clean, f, indent=2, sort_keys=True)
     except OSError:
         return
 

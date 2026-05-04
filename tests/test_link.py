@@ -150,3 +150,96 @@ def test_link_all_writes_cache_json(tmp_path: Path) -> None:
     assert files
     data = json.loads(files[0].read_text())
     assert data[0]["relation"] == "supports"
+
+
+def test_link_all_emits_progress_messages(tmp_path: Path, capsys: Any) -> None:
+    """Linker must emit decile progress ticks like extract_many and enrich."""
+
+    def fake_llm(prompt: str, **kw: Any) -> str:
+        return json.dumps(
+            {"links": [{"target_index": 0, "relation": "references", "confidence": "EXTRACTED"}]}
+        )
+
+    pairs = [
+        (Entity(id=f"s{i}", name=f"S{i}", kind="concept", context="ctx"), _targets()[:1])
+        for i in range(20)
+    ]
+    link_all(pairs, output_dir=tmp_path, workers=1, llm=fake_llm)
+    out = capsys.readouterr().out
+    progress_lines = [line for line in out.splitlines() if "Linking:" in line and "/20" in line]
+    assert len(progress_lines) >= 2
+    assert "20/20" in progress_lines[-1]
+
+
+def test_link_all_emits_progress_parallel(tmp_path: Path, capsys: Any) -> None:
+    """ThreadPoolExecutor path must also emit decile ticks."""
+
+    def fake_llm(prompt: str, **kw: Any) -> str:
+        return json.dumps(
+            {"links": [{"target_index": 0, "relation": "references", "confidence": "EXTRACTED"}]}
+        )
+
+    pairs = [
+        (Entity(id=f"p{i}", name=f"P{i}", kind="concept", context="ctx"), _targets()[:1])
+        for i in range(20)
+    ]
+    link_all(pairs, output_dir=tmp_path, workers=4, llm=fake_llm)
+    out = capsys.readouterr().out
+    progress_lines = [line for line in out.splitlines() if "Linking:" in line and "/20" in line]
+    assert len(progress_lines) >= 2
+    assert "20/20" in progress_lines[-1]
+
+
+def test_link_all_emits_failure_summary(tmp_path: Path, capsys: Any) -> None:
+    """Linking failures must produce a phase summary with error class."""
+    calls = {"n": 0}
+
+    def failing_llm(prompt: str, **kw: Any) -> str:
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            raise OSError("disk full")
+        return json.dumps(
+            {"links": [{"target_index": 0, "relation": "references", "confidence": "EXTRACTED"}]}
+        )
+
+    s1 = Entity(id="s1", name="S1", kind="concept", context="ctx")
+    s2 = Entity(id="s2", name="S2", kind="concept", context="ctx")
+    tgt = [Entity(id="t1", name="T1", kind="concept", context="ctx")]
+
+    decisions, stats = link_all(
+        [(s1, tgt), (s2, tgt)], output_dir=tmp_path, workers=1, llm=failing_llm
+    )
+    out = capsys.readouterr().out
+    assert "1/2 succeeded" in out
+    assert "1 failed" in out
+    assert "OSError" in out
+    assert len(decisions) >= 1
+    assert stats.total == 2
+    assert stats.succeeded == 1
+    assert stats.failed == 1
+
+
+def test_link_all_counts_llm_failures_in_stats(tmp_path: Path, capsys: Any) -> None:
+    """LLM failures caught inside link_entities must appear in LinkStats."""
+    calls = {"n": 0}
+
+    def flaky_llm(prompt: str, **kw: Any) -> str:
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            raise LLMError("model overloaded")
+        return json.dumps(
+            {"links": [{"target_index": 0, "relation": "supports", "confidence": "EXTRACTED"}]}
+        )
+
+    s1 = Entity(id="s1", name="S1", kind="concept", context="ctx")
+    s2 = Entity(id="s2", name="S2", kind="concept", context="ctx")
+    tgt = [Entity(id="t1", name="T1", kind="concept", context="ctx")]
+
+    decisions, stats = link_all(
+        [(s1, tgt), (s2, tgt)], output_dir=tmp_path, workers=1, llm=flaky_llm
+    )
+    assert stats.total == 2
+    assert stats.succeeded == 1
+    assert stats.failed == 1
+    out = capsys.readouterr().out
+    assert "LLM failures" in out

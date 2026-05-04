@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import networkx as nx
+import pytest
 import yaml
 
 from pengram.export_penfield import (
@@ -624,3 +625,251 @@ def test_self_loop_excluded_from_frontmatter(tmp_path: Path) -> None:
     text = (vault / "concepts" / "c.md").read_text()
     fm = _parse_frontmatter(text)
     assert "references" not in fm
+
+
+def test_export_penfield_rerun_does_not_rewrite_unchanged_files(tmp_path: Path) -> None:
+    """Second export of identical content must not touch the filesystem."""
+    g = nx.DiGraph()
+    g.add_node("c", kind="concept", label="C", mentions=5)
+    g.add_node("d", kind="document", label="d", body="x", source_path="")
+    g.add_edge("d", "c", relation="references", confidence="EXTRACTED")
+
+    vault = export_penfield(g, tmp_path)
+    note = vault / "concepts" / "c.md"
+    mtime_first = note.stat().st_mtime_ns
+
+    import time
+
+    time.sleep(0.01)
+    export_penfield(g, tmp_path)
+    mtime_second = note.stat().st_mtime_ns
+    assert mtime_first == mtime_second
+
+
+def test_write_text_if_changed_skips_identical(tmp_path: Path) -> None:
+    from pengram.export_common import write_text_if_changed
+
+    p = tmp_path / "test.md"
+    assert write_text_if_changed(p, "hello") is True
+    mtime = p.stat().st_mtime_ns
+
+    import time
+
+    time.sleep(0.01)
+    assert write_text_if_changed(p, "hello") is False
+    assert p.stat().st_mtime_ns == mtime
+
+
+def test_write_text_if_changed_writes_when_different(tmp_path: Path) -> None:
+    from pengram.export_common import write_text_if_changed
+
+    p = tmp_path / "test.md"
+    write_text_if_changed(p, "v1")
+    assert write_text_if_changed(p, "v2") is True
+    assert p.read_text() == "v2"
+
+
+def test_copy_if_changed_skips_identical(tmp_path: Path) -> None:
+    from pengram.export_common import copy_if_changed
+
+    src = tmp_path / "src.png"
+    dest = tmp_path / "dest.png"
+    src.write_bytes(b"imagedata")
+    assert copy_if_changed(src, dest) is True
+    mtime = dest.stat().st_mtime_ns
+
+    import time
+
+    time.sleep(0.01)
+    assert copy_if_changed(src, dest) is False
+    assert dest.stat().st_mtime_ns == mtime
+
+
+def test_copy_if_changed_copies_when_different(tmp_path: Path) -> None:
+    from pengram.export_common import copy_if_changed
+
+    src = tmp_path / "src.png"
+    dest = tmp_path / "dest.png"
+    src.write_bytes(b"v1")
+    dest.write_bytes(b"old")
+    assert copy_if_changed(src, dest) is True
+    assert dest.read_bytes() == b"v1"
+
+
+def _make_graph() -> nx.DiGraph:
+    g = nx.DiGraph()
+    g.add_node("c", kind="concept", label="C", mentions=5)
+    g.add_node("d", kind="document", label="d", body="x", source_path="")
+    g.add_edge("d", "c", relation="references", confidence="EXTRACTED")
+    return g
+
+
+def test_export_obsidian_rerun_skips_unchanged(tmp_path: Path) -> None:
+    import time
+
+    from pengram.export_obsidian import export_obsidian
+
+    g = _make_graph()
+    vault = export_obsidian(g, tmp_path)
+    note = vault / "concepts" / "c.md"
+    mtime = note.stat().st_mtime_ns
+    time.sleep(0.01)
+    export_obsidian(g, tmp_path)
+    assert note.stat().st_mtime_ns == mtime
+
+
+def test_export_html_rerun_skips_unchanged(tmp_path: Path) -> None:
+    import time
+
+    from pengram.export_html import export_html
+
+    g = _make_graph()
+    p = export_html(g, tmp_path)
+    mtime = p.stat().st_mtime_ns
+    time.sleep(0.01)
+    export_html(g, tmp_path)
+    assert p.stat().st_mtime_ns == mtime
+
+
+def test_export_json_rerun_skips_unchanged(tmp_path: Path) -> None:
+    import time
+
+    from pengram.export_json import export_json
+
+    g = _make_graph()
+    p = export_json(g, tmp_path)
+    mtime = p.stat().st_mtime_ns
+    time.sleep(0.01)
+    export_json(g, tmp_path)
+    assert p.stat().st_mtime_ns == mtime
+
+
+# ---------------------------------------------------------------------------
+# Stale vault file purging
+# ---------------------------------------------------------------------------
+
+
+def test_export_penfield_purges_stale_notes(tmp_path: Path) -> None:
+    """Lowering threshold or removing a concept must delete its vault note."""
+    g = nx.DiGraph()
+    g.add_node("a", label="Alpha", kind="concept", mentions=5)
+    g.add_node("b", label="Beta", kind="concept", mentions=5)
+    g.add_node("d", label="d", kind="document", body="x", source_path="")
+    g.add_edge("d", "a", relation="references")
+    g.add_edge("d", "b", relation="references")
+    g.add_edge("a", "b", relation="references")
+
+    vault = export_penfield(g, tmp_path)
+    assert (vault / "concepts" / "alpha.md").exists()
+    assert (vault / "concepts" / "beta.md").exists()
+
+    # Second run: remove concept 'b' from graph.
+    g.remove_node("b")
+    export_penfield(g, tmp_path)
+    assert (vault / "concepts" / "alpha.md").exists()
+    assert not (vault / "concepts" / "beta.md").exists()
+
+
+def test_export_penfield_purge_removes_empty_dirs(tmp_path: Path) -> None:
+    """After purging all notes from a subdirectory, that directory is cleaned up."""
+    g = nx.DiGraph()
+    g.add_node("a", label="Alpha", kind="concept", mentions=5)
+    g.add_node("d", label="d", kind="document", body="x", source_path="sub")
+    g.add_edge("d", "a", relation="references")
+
+    vault = export_penfield(g, tmp_path)
+    assert (vault / "documents" / "sub").is_dir()
+
+    # Second run: remove document.
+    g.remove_node("d")
+    export_penfield(g, tmp_path)
+    assert not (vault / "documents" / "sub").exists()
+
+
+def test_export_obsidian_purges_stale_notes(tmp_path: Path) -> None:
+    from pengram.export_obsidian import export_obsidian
+
+    g = nx.DiGraph()
+    g.add_node("a", label="Alpha", kind="concept", mentions=5)
+    g.add_node("b", label="Beta", kind="concept", mentions=5)
+    g.add_node("d", label="d", kind="document", body="x", source_path="")
+    g.add_edge("d", "a", relation="references")
+    g.add_edge("d", "b", relation="references")
+    g.add_edge("a", "b", relation="references")
+
+    vault = export_obsidian(g, tmp_path)
+    assert (vault / "concepts" / "beta.md").exists()
+
+    g.remove_node("b")
+    export_obsidian(g, tmp_path)
+    assert (vault / "concepts" / "alpha.md").exists()
+    assert not (vault / "concepts" / "beta.md").exists()
+
+
+def test_purge_stale_files_unit(tmp_path: Path) -> None:
+    from pengram.export_common import purge_stale_files
+
+    vault = tmp_path / "vault"
+    (vault / "concepts").mkdir(parents=True)
+    keep = vault / "concepts" / "keep.md"
+    stale = vault / "concepts" / "stale.md"
+    keep.write_text("k")
+    stale.write_text("s")
+
+    removed = purge_stale_files(vault, {keep})
+    assert removed == 1
+    assert keep.exists()
+    assert not stale.exists()
+
+
+def test_purge_ignores_non_matching_extensions(tmp_path: Path) -> None:
+    from pengram.export_common import purge_stale_files
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "data.json").write_text("{}")
+    removed = purge_stale_files(vault, set())
+    assert removed == 0
+    assert (vault / "data.json").exists()
+
+
+def test_export_penfield_emits_progress_ticks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ticks: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(
+        "pengram.export_penfield._ui_step",
+        lambda cur, tot, lbl: ticks.append((cur, tot, lbl)),
+    )
+    g = nx.DiGraph()
+    for i in range(20):
+        g.add_node(f"concept_{i}", label=f"C{i}", kind="concept", mentions=5)
+    g.add_node("_doc", label="doc.md", kind="document")
+    for i in range(20):
+        g.add_edge("_doc", f"concept_{i}", relation="references")
+    export_penfield(g, tmp_path)
+    assert len(ticks) > 1
+    assert all(lbl == "Export (Penfield)" for _, _, lbl in ticks)
+    assert ticks[-1][0] == ticks[-1][1]
+
+
+def test_export_obsidian_emits_progress_ticks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pengram.export_obsidian import export_obsidian
+
+    ticks: list[tuple[int, int, str]] = []
+    monkeypatch.setattr(
+        "pengram.export_obsidian._ui_step",
+        lambda cur, tot, lbl: ticks.append((cur, tot, lbl)),
+    )
+    g = nx.DiGraph()
+    for i in range(20):
+        g.add_node(f"concept_{i}", label=f"C{i}", kind="concept", mentions=5)
+    g.add_node("_doc", label="doc.md", kind="document")
+    for i in range(20):
+        g.add_edge("_doc", f"concept_{i}", relation="references")
+    export_obsidian(g, tmp_path)
+    assert len(ticks) > 1
+    assert all(lbl == "Export (Obsidian)" for _, _, lbl in ticks)
+    assert ticks[-1][0] == ticks[-1][1]

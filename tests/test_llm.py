@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from pengram.llm import LLMError, call_llm, parse_json_response
+from pengram.llm import LLMError, TransientLLMError, call_llm, parse_json_response
 
 
 def make_result(
@@ -24,7 +24,9 @@ def make_result(
 # ---------------------------------------------------------------------------
 
 
-def test_claude_cli_success() -> None:
+def test_claude_cli_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("pengram.llm.resolve_tool", lambda *a, **kw: "claude")
+
     def runner(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
         assert args[0] == "claude"
         return make_result(stdout="hello there")
@@ -33,15 +35,18 @@ def test_claude_cli_success() -> None:
     assert out == "hello there"
 
 
-def test_claude_cli_missing_binary() -> None:
-    def runner(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
-        raise FileNotFoundError("claude")
+def test_claude_cli_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("pengram._tools.shutil.which", lambda name: None)
+    monkeypatch.setattr("pengram._tools._venv_bin_dir", lambda: None)
+    from pengram._tools import ToolNotFoundError
 
-    with pytest.raises(LLMError, match="claude CLI not found"):
-        call_llm("hi", provider="claude-cli", runner=runner)
+    with pytest.raises((LLMError, ToolNotFoundError), match="claude|not found"):
+        call_llm("hi", provider="claude-cli")
 
 
-def test_claude_cli_nonzero_exit() -> None:
+def test_claude_cli_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("pengram.llm.resolve_tool", lambda *a, **kw: "claude")
+
     def runner(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
         return make_result(stderr="bad", returncode=2)
 
@@ -49,12 +54,14 @@ def test_claude_cli_nonzero_exit() -> None:
         call_llm("hi", provider="claude-cli", runner=runner)
 
 
-def test_claude_cli_timeout() -> None:
+def test_claude_cli_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("pengram.llm.resolve_tool", lambda *a, **kw: "claude")
+
     def runner(args: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(args, 5)
 
     with pytest.raises(LLMError, match="timed out"):
-        call_llm("hi", provider="claude-cli", runner=runner)
+        call_llm("hi", provider="claude-cli", runner=runner, _sleep=lambda _: None)
 
 
 # ---------------------------------------------------------------------------
@@ -448,3 +455,77 @@ def test_parse_json_invalid_raises() -> None:
 
 def test_parse_json_array() -> None:
     assert parse_json_response("[1, 2, 3]") == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Retry logic
+# ---------------------------------------------------------------------------
+
+
+def test_with_retry_succeeds_on_first_attempt() -> None:
+    from pengram.llm import _with_retry
+
+    assert _with_retry(lambda: "ok") == "ok"
+
+
+def test_with_retry_retries_transient_then_succeeds() -> None:
+    from pengram.llm import _with_retry
+
+    calls = {"n": 0}
+
+    def flaky() -> str:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise TransientLLMError("network glitch")
+        return "recovered"
+
+    sleeps: list[float] = []
+    result = _with_retry(flaky, delays=(0, 0, 0), sleep=lambda s: sleeps.append(s))
+    assert result == "recovered"
+    assert calls["n"] == 3
+    assert len(sleeps) == 2
+
+
+def test_with_retry_raises_after_exhausting_attempts() -> None:
+    from pengram.llm import _with_retry
+
+    def always_fails() -> str:
+        raise TransientLLMError("down")
+
+    with pytest.raises(TransientLLMError, match="down"):
+        _with_retry(always_fails, delays=(0, 0, 0), sleep=lambda _: None)
+
+
+def test_with_retry_does_not_retry_permanent_errors() -> None:
+    from pengram.llm import _with_retry
+
+    calls = {"n": 0}
+
+    def permanent() -> str:
+        calls["n"] += 1
+        raise LLMError("auth failure")
+
+    with pytest.raises(LLMError, match="auth failure"):
+        _with_retry(permanent, delays=(0, 0, 0), sleep=lambda _: None)
+    assert calls["n"] == 1
+
+
+def test_call_llm_retries_transient_claude_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("pengram.llm.resolve_tool", lambda *a, **kw: "claude")
+    calls = {"n": 0}
+
+    def fake_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise subprocess.TimeoutExpired(cmd="claude", timeout=5)
+        return make_result(stdout="ok")
+
+    result = call_llm(
+        "hi", provider="claude-cli", runner=fake_runner, model="haiku", _sleep=lambda _: None
+    )
+    assert result == "ok"
+    assert calls["n"] == 2
+
+
+def test_transient_llm_error_is_subclass_of_llm_error() -> None:
+    assert issubclass(TransientLLMError, LLMError)
